@@ -56,6 +56,17 @@ def setup_logging(results_dir):
     return logger
 
 
+def find_ecg_path(study_id, ecg_data_root):
+    """Find the ECG file path for a given study ID."""
+    import glob
+    # Search for the .dat file with this study ID
+    pattern = os.path.join(ecg_data_root, f"**/s{study_id}/{study_id}.dat")
+    matches = glob.glob(pattern, recursive=True)
+    if matches:
+        return matches[0]
+    return None
+
+
 def load_mini100_dataset(dataset_path, ecg_data_path, eos_token, logger):
     """Load the MIMIC-IV mini-100 dataset."""
     import json
@@ -81,6 +92,37 @@ def load_mini100_dataset(dataset_path, ecg_data_path, eos_token, logger):
                 ecg_ids.append(int(parts[1]))
 
     logger.info(f"Loaded {len(ecg_ids)} unique ECG IDs")
+
+    # Build a mapping from ECG IDs to paths
+    logger.info("Building ECG ID to path mapping...")
+    ecg_id_to_path = {}
+    for ecg_id in ecg_ids:
+        ecg_path = find_ecg_path(ecg_id, ecg_data_path)
+        if ecg_path:
+            ecg_id_to_path[ecg_id] = ecg_path
+        else:
+            logger.warning(f"Could not find ECG file for study ID: {ecg_id}")
+
+    logger.info(f"Found paths for {len(ecg_id_to_path)}/{len(ecg_ids)} ECG files")
+
+    # Convert answer from list to string and add required fields for each sample
+    for sample in qa_samples:
+        if isinstance(sample.get('answer'), list):
+            # Convert list to string (take first element for single answers)
+            sample['answer'] = sample['answer'][0] if len(sample['answer']) > 0 else ""
+
+        # Add clinical_contexts if missing (required by ECGQAMimicIVDataset)
+        if 'clinical_contexts' not in sample:
+            sample['clinical_contexts'] = [""]  # Empty context for zero-shot evaluation
+
+        # Add ecg_paths based on ecg_id
+        if 'ecg_paths' not in sample and 'ecg_id' in sample:
+            ecg_ids_list = sample['ecg_id'] if isinstance(sample['ecg_id'], list) else [sample['ecg_id']]
+            ecg_paths_list = []
+            for eid in ecg_ids_list:
+                if eid in ecg_id_to_path:
+                    ecg_paths_list.append(ecg_id_to_path[eid])
+            sample['ecg_paths'] = ecg_paths_list
 
     # Convert to Dataset
     dataset = Dataset.from_list(qa_samples)
