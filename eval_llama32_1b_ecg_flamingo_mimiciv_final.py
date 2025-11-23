@@ -56,15 +56,48 @@ def setup_logging(results_dir):
     return logger
 
 
-def find_ecg_path(study_id, ecg_data_root):
-    """Find the ECG file path for a given study ID."""
-    import glob
-    # Search for the .dat file with this study ID
-    pattern = os.path.join(ecg_data_root, f"**/s{study_id}/{study_id}.dat")
-    matches = glob.glob(pattern, recursive=True)
-    if matches:
-        return matches[0]
-    return None
+def build_ecg_id_to_path_mapping(ecg_data_root, logger):
+    """Build mapping from study ID to file path using a single efficient scan."""
+    import subprocess
+
+    logger.info("Building ECG ID to path mapping (using single optimized scan)...")
+
+    # Use find command to get all .dat files in one go
+    try:
+        result = subprocess.run(
+            ['find', ecg_data_root, '-name', '*.dat', '-type', 'f'],
+            capture_output=True,
+            text=True,
+            timeout=60
+        )
+
+        ecg_id_to_path = {}
+        for path in result.stdout.strip().split('\n'):
+            if not path:
+                continue
+            # Extract study ID from path like: .../s12345678/12345678.dat
+            parts = path.split('/')
+            for i, part in enumerate(parts):
+                if part.startswith('s') and i + 1 < len(parts):
+                    filename = parts[i + 1]
+                    if filename.endswith('.dat'):
+                        study_id_str = filename[:-4]  # Remove .dat
+                        try:
+                            study_id = int(study_id_str)
+                            ecg_id_to_path[study_id] = path
+                            break
+                        except ValueError:
+                            continue
+
+        logger.info(f"Built mapping for {len(ecg_id_to_path)} ECG files")
+        return ecg_id_to_path
+
+    except subprocess.TimeoutExpired:
+        logger.error("Timeout while scanning ECG directory")
+        return {}
+    except Exception as e:
+        logger.error(f"Error building ECG mapping: {e}")
+        return {}
 
 
 def load_mini100_dataset(dataset_path, ecg_data_path, eos_token, logger):
@@ -93,17 +126,16 @@ def load_mini100_dataset(dataset_path, ecg_data_path, eos_token, logger):
 
     logger.info(f"Loaded {len(ecg_ids)} unique ECG IDs")
 
-    # Build a mapping from ECG IDs to paths
-    logger.info("Building ECG ID to path mapping...")
-    ecg_id_to_path = {}
-    for ecg_id in ecg_ids:
-        ecg_path = find_ecg_path(ecg_id, ecg_data_path)
-        if ecg_path:
-            ecg_id_to_path[ecg_id] = ecg_path
-        else:
-            logger.warning(f"Could not find ECG file for study ID: {ecg_id}")
+    # Build a mapping from ECG IDs to paths (single efficient scan)
+    ecg_id_to_path = build_ecg_id_to_path_mapping(ecg_data_path, logger)
 
-    logger.info(f"Found paths for {len(ecg_id_to_path)}/{len(ecg_ids)} ECG files")
+    # Check how many of our needed ECGs were found
+    found_count = sum(1 for ecg_id in ecg_ids if ecg_id in ecg_id_to_path)
+    logger.info(f"Found paths for {found_count}/{len(ecg_ids)} needed ECG files")
+
+    for ecg_id in ecg_ids:
+        if ecg_id not in ecg_id_to_path:
+            logger.warning(f"Could not find ECG file for study ID: {ecg_id}")
 
     # Convert answer from list to string and add required fields for each sample
     for sample in qa_samples:
@@ -254,6 +286,8 @@ def create_modified_opentslm_flamingo(device, llm_id, cross_attn_every_n_layers,
         cross_attn_every_n_layers=cross_attn_every_n_layers,
     )
 
+    # Return the raw flamingo model
+    # We'll handle data preprocessing in the evaluation loop using OpenTSLMFlamingo's logic as reference
     return flamingo_model, text_tokenizer
 
 
@@ -376,56 +410,33 @@ def evaluate_model_on_mimiciv_mini100():
     logger.info("Running zero-shot evaluation")
     logger.info("="*60)
 
-    # Import the generation function from OpenTSLMFlamingo
-    from model.llm.OpenTSLMFlamingo import OpenTSLMFlamingo
-
-    # Create a wrapper that has the generate method
-    class ModelWrapper:
-        def __init__(self, flamingo_model, text_tokenizer, device):
-            self.llm = flamingo_model
-            self.text_tokenizer = text_tokenizer
+    # Create a wrapper that uses OpenTSLMFlamingo's data preprocessing logic
+    class FlamingoWrapper:
+        def __init__(self, llm, tokenizer, device):
+            self.llm = llm
+            self.text_tokenizer = tokenizer
             self.device = device
 
-        def pad_and_apply_batch(self, batch, include_labels=True):
-            """Simplified version of pad_and_apply_batch from OpenTSLMFlamingo."""
-            from time_series_datasets.util import extend_time_series_to_match_patch_size_and_aggregate
-
-            # Extract batch components
-            sample = batch[0]
-
-            # Get input_ids from pre_prompt + post_prompt
-            pre_prompt = sample.get("pre_prompt", "")
-            post_prompt = sample.get("post_prompt", "")
-
-            # Tokenize
-            input_ids = self.text_tokenizer(
-                pre_prompt + post_prompt,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=2048,
-            )["input_ids"].to(self.device)
-
-            # Get time series data
-            time_series = sample.get("time_series", None)
-            if time_series is not None:
-                if not isinstance(time_series, torch.Tensor):
-                    time_series = torch.tensor(time_series)
-                time_series = time_series.unsqueeze(0).to(self.device)
-
-            # Create attention mask
-            attention_mask = torch.ones_like(input_ids)
-
-            # Labels (for compatibility, not used in generation)
-            labels = input_ids.clone() if include_labels else None
-
-            return input_ids, time_series, attention_mask, labels
-
         def generate(self, batch, max_new_tokens=50):
-            """Generate predictions for a batch."""
-            with torch.inference_mode():
-                input_ids, images, attention_mask, _ = self.pad_and_apply_batch(batch, include_labels=True)
+            """Generate using proper data preprocessing from OpenTSLMFlamingo."""
+            # Import the OpenTSLMFlamingo to use its pad_and_apply_batch method
+            from model.llm.OpenTSLMFlamingo import OpenTSLMFlamingo
 
+            # Create a temporary instance just to use its data preprocessing
+            # This is hacky but necessary since we can't instantiate OpenTSLMFlamingo with our loaded model
+            temp_wrapper = type('TempWrapper', (), {
+                'text_tokenizer': self.text_tokenizer,
+                'device': self.device,
+                'llm': self.llm
+            })()
+
+            # Use the pad_and_apply_batch method from OpenTSLMFlamingo
+            input_ids, images, attention_mask, _ = OpenTSLMFlamingo.pad_and_apply_batch(
+                temp_wrapper, batch, include_labels=True
+            )
+
+            # Generate
+            with torch.inference_mode():
                 gen_ids = self.llm.generate(
                     vision_x=images,
                     lang_x=input_ids,
@@ -440,7 +451,7 @@ def evaluate_model_on_mimiciv_mini100():
 
                 return self.text_tokenizer.batch_decode(answer_only_ids, skip_special_tokens=True)
 
-    model_wrapper = ModelWrapper(flamingo_model, text_tokenizer, device)
+    model_wrapper = FlamingoWrapper(flamingo_model, text_tokenizer, device)
 
     results = []
     correct = 0

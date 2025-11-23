@@ -1,0 +1,117 @@
+============================================================
+MIMIC-IV ECG-QA Mini-100 Evaluation Summary
+============================================================
+
+Model: OpenTSLM/llama-3.2-1b-ecg-flamingo
+Base LLM: meta-llama/Llama-3.2-1B
+Architecture: OpenTSLMFlamingo (TimeSeriesFlamingoWithTrainableEncoder)
+Checkpoint: softprompt-llama_3_2_1b-ecg.pt
+Max Patches: 1024
+Dataset: MIMIC-IV ECG-QA mini-100
+Evaluation Date: 20251123_154142
+Device: cuda
+
+Overall Results:
+  Total Samples: 100
+  Correct: 0
+  Accuracy: 0.00%
+
+Per-Question-Type Accuracy:
+  comparison_consecutive-query:
+    Accuracy: 0.00%
+    Correct/Total: 0/23
+
+  comparison_consecutive-verify:
+    Accuracy: 0.00%
+    Correct/Total: 0/19
+
+  comparison_irrelevant-query:
+    Accuracy: 0.00%
+    Correct/Total: 0/2
+
+  comparison_irrelevant-verify:
+    Accuracy: 0.00%
+    Correct/Total: 0/7
+
+  single-choose:
+    Accuracy: 0.00%
+    Correct/Total: 0/14
+
+  single-query:
+    Accuracy: 0.00%
+    Correct/Total: 0/23
+
+  single-verify:
+    Accuracy: 0.00%
+    Correct/Total: 0/12
+
+Per-Attribute-Type Accuracy:
+  :
+    Accuracy: 0.00%
+    Correct/Total: 0/100
+
+
+============================================================
+Example Predictions (first 10 samples)
+============================================================
+
+Sample 1:
+  Question: What are the rhythm-related indications that can be seen on this ECG?
+  Ground Truth: atrial fibrillation<|end_of_text|>
+  Prediction: [ERROR]
+  Correct: ✗
+
+Sample 2:
+  Question: What is the diagnostic symptom indicated by this ECG, specifically Myocardial infarction in inferior leads or AV-junctional rhythm, including any uncertain symptoms?
+  Ground Truth: Myocardial infarction in inferior leads<|end_of_text|>
+  Prediction: [ERROR]
+  Correct: ✗
+
+Sample 3:
+  Question: What are the symptoms that were present in the previous tracing that have been resolved in the previous one?
+  Ground Truth: left anterior fascicular block<|end_of_text|>
+  Prediction: [ERROR]
+  Correct: ✗
+
+Sample 4:
+  Question: Is ST Elevation still accounted for in the recent tracing, in comparison to the previous one?
+  Ground Truth: yes<|end_of_text|>
+  Prediction: [ERROR]
+  Correct: ✗
+
+Sample 5:
+  Question: When comparing the recent tracing to the previous one, has the incomplete right bundle branch block been resolved?
+  Ground Truth: yes<|end_of_text|>
+  Prediction: [ERROR]
+  Correct: ✗
+
+Sample 6:
+  Question: Is lead V3 showing indications of Deep S wave in this ECG?
+  Ground Truth: no<|end_of_text|>
+  Prediction: [ERROR]
+  Correct: ✗
+
+Sample 7:
+  Question: Could you explain the diagnostic symptoms in this ECG, both certain and uncertain?
+  Ground Truth: ST-T change due to ventricular hypertrophy<|end_of_text|>
+  Prediction: [ERROR]
+  Correct: ✗
+
+Sample 8:
+  Question: Is there evidence of non-specific t abnormality in frontal leads on this ECG?
+  Ground Truth: no<|end_of_text|>
+  Prediction: [ERROR]
+  Correct: ✗
+
+Sample 9:
+  Question: What does this ECG reveal in terms of diagnostic symptoms, both certain and questionable?
+  Ground Truth: Myocardial infarction in septal leads<|end_of_text|>
+  Prediction: [ERROR]
+  Correct: ✗
+
+Sample 10:
+  Question: What are the new symptoms detected in the recent tracing in comparison to the previous one?
+  Ground Truth: sinus bradycardia<|end_of_text|>
+  Prediction: [ERROR]
+  Correct: ✗
+
