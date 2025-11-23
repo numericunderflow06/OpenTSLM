@@ -1,0 +1,117 @@
+============================================================
+MIMIC-IV ECG-QA Mini-100 Evaluation Summary
+============================================================
+
+Model: OpenTSLM/llama-3.2-1b-ecg-flamingo
+Base LLM: meta-llama/Llama-3.2-1B
+Architecture: OpenTSLMFlamingo (TimeSeriesFlamingoWithTrainableEncoder)
+Checkpoint: softprompt-llama_3_2_1b-ecg.pt
+Max Patches: 1024
+Dataset: MIMIC-IV ECG-QA mini-100
+Evaluation Date: 20251123_194505
+Device: cuda
+
+Overall Results:
+  Total Samples: 100
+  Correct: 0
+  Accuracy: 0.00%
+
+Per-Question-Type Accuracy:
+  comparison_consecutive-query:
+    Accuracy: 0.00%
+    Correct/Total: 0/23
+
+  comparison_consecutive-verify:
+    Accuracy: 0.00%
+    Correct/Total: 0/19
+
+  comparison_irrelevant-query:
+    Accuracy: 0.00%
+    Correct/Total: 0/2
+
+  comparison_irrelevant-verify:
+    Accuracy: 0.00%
+    Correct/Total: 0/7
+
+  single-choose:
+    Accuracy: 0.00%
+    Correct/Total: 0/14
+
+  single-query:
+    Accuracy: 0.00%
+    Correct/Total: 0/23
+
+  single-verify:
+    Accuracy: 0.00%
+    Correct/Total: 0/12
+
+Per-Attribute-Type Accuracy:
+  :
+    Accuracy: 0.00%
+    Correct/Total: 0/100
+
+
+============================================================
+Example Predictions (first 10 samples)
+============================================================
+
+Sample 1:
+  Question: What are the rhythm-related indications that can be seen on this ECG?
+  Ground Truth: atrial fibrillation<|end_of_text|>
+  Prediction: , supraventricular tachycardia, sinus tachycardia, supraventricular tachycardia, sinus tachycardia, sinus tachycardia, sinus tachycardia, sinus
+  Correct: ✗
+
+Sample 2:
+  Question: What is the diagnostic symptom indicated by this ECG, specifically Myocardial infarction in inferior leads or AV-junctional rhythm, including any uncertain symptoms?
+  Ground Truth: Myocardial infarction in inferior leads<|end_of_text|>
+  Prediction: , ischemic ST/T changes in lateral leads, ischemic ST/T changes in anterolateral leads, ischemic ST/T changes in lateral leads, ischemic ST/T changes in lateral leads, ischemic ST/T changes in lateral leads, ischem
+  Correct: ✗
+
+Sample 3:
+  Question: What are the symptoms that were present in the previous tracing that have been resolved in the previous one?
+  Ground Truth: left anterior fascicular block<|end_of_text|>
+  Prediction: , supraventricular tachycardia, sinus tachycardia, sinus tachycardia with narrow QRS complexes, supraventricular tachycardia with narrow QRS complexes, supraventricular t
+  Correct: ✗
+
+Sample 4:
+  Question: Is ST Elevation still accounted for in the recent tracing, in comparison to the previous one?
+  Ground Truth: yes<|end_of_text|>
+  Prediction: , st elevation, st elevation present, st elevation in the inferior leads, st elevation in the inferior leads, st elevation in the inferior leads, st elevation in the inferior leads, st elevation in the inferior leads, st elevation in the inferior leads,
+  Correct: ✗
+
+Sample 5:
+  Question: When comparing the recent tracing to the previous one, has the incomplete right bundle branch block been resolved?
+  Ground Truth: yes<|end_of_text|>
+  Prediction: , or analyzing st segments and segments in the ECG for signs of ischemia or other cardiac conditions. In this case, the presence of an incomplete right bundle branch block would be suggested by changes in the right precordial leads, such as an r
+  Correct: ✗
+
+Sample 6:
+  Question: Is lead V3 showing indications of Deep S wave in this ECG?
+  Ground Truth: no<|end_of_text|>
+  Prediction: , or, III, and st st st st st st st st st st st st st st st st st st st st st st st st st st st st st st st st st st st st st st st st st st st st
+  Correct: ✗
+
+Sample 7:
+  Question: Could you explain the diagnostic symptoms in this ECG, both certain and uncertain?
+  Ground Truth: ST-T change due to ventricular hypertrophy<|end_of_text|>
+  Prediction: , st/t changes, ischemic st/t changes, st/t changes, ischemic ST/T changes, ischemic st/t changes, ischemic ST/T changes, ischemic ST/T changes, ischemic ST/T changes, ischemic ST/T changes
+  Correct: ✗
+
+Sample 8:
+  Question: Is there evidence of non-specific t abnormality in frontal leads on this ECG?
+  Ground Truth: no<|end_of_text|>
+  Prediction: , and, the st segment is elevated in lead aVL, which could suggest ischemia or other non-specific changes. However, the presence of a pacemaker can alter the morphology of the ECG, making it challenging to attribute ST changes solely to
+  Correct: ✗
+
+Sample 9:
+  Question: What does this ECG reveal in terms of diagnostic symptoms, both certain and questionable?
+  Ground Truth: Myocardial infarction in septal leads<|end_of_text|>
+  Prediction: , pericarditis, sinus tachycardia, and the presence of a pacemaker might mask the ECG findings.
+  Correct: ✗
+
+Sample 10:
+  Question: What are the new symptoms detected in the recent tracing in comparison to the previous one?
+  Ground Truth: sinus bradycardia<|end_of_text|>
+  Prediction: , ventricular pacing, ventricular pacing, ventricular tachycardia, right bundle branch block, right bundle branch block with characteristic features, right bundle branch block, right bundle branch block with rSR' pattern in V1, right bundle
+  Correct: ✗
+

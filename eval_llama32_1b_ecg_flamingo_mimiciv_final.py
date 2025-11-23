@@ -202,7 +202,9 @@ def normalize_answer(answer):
     """Normalize answer for comparison."""
     if isinstance(answer, list):
         answer = answer[0] if len(answer) > 0 else ""
-    return str(answer).lower().strip()
+    # Remove special tokens like <|end_of_text|>
+    answer = str(answer).replace('<|end_of_text|>', '').replace('<|endofchunk|>', '').replace('<image>', '')
+    return answer.lower().strip()
 
 
 def check_answer_correctness(prediction, ground_truth):
@@ -349,12 +351,26 @@ def evaluate_model_on_mimiciv_mini100():
 
         # Load model state
         if 'model_state' in ckpt:
-            missing_keys, unexpected_keys = flamingo_model.load_state_dict(ckpt['model_state'], strict=False)
+            # CRITICAL FIX: Strip 'model.' prefix from checkpoint keys
+            # The checkpoint was saved from OpenTSLMFlamingo which wraps the model in self.model
+            # We're loading directly into TimeSeriesFlamingoWithTrainableEncoder, so we need to strip the prefix
+            state_dict = ckpt['model_state']
+            fixed_state_dict = {}
+            for key, value in state_dict.items():
+                if key.startswith('model.'):
+                    new_key = key[6:]  # Remove 'model.' prefix (6 characters)
+                    fixed_state_dict[new_key] = value
+                else:
+                    fixed_state_dict[key] = value
+
+            logger.info(f"Fixed {len([k for k in state_dict.keys() if k.startswith('model.')])} keys by stripping 'model.' prefix")
+
+            missing_keys, unexpected_keys = flamingo_model.load_state_dict(fixed_state_dict, strict=False)
             logger.info(f"✓ Loaded model from epoch {ckpt.get('epoch', '?')}")
             if missing_keys:
-                logger.warning(f"Missing keys: {missing_keys}")
+                logger.warning(f"Missing keys ({len(missing_keys)}): {missing_keys[:5]}...")
             if unexpected_keys:
-                logger.warning(f"Unexpected keys: {unexpected_keys}")
+                logger.warning(f"Unexpected keys ({len(unexpected_keys)}): {unexpected_keys[:5]}...")
         else:
             logger.error("✗ Checkpoint format not recognized")
             return
