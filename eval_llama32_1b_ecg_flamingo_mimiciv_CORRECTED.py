@@ -352,26 +352,22 @@ def evaluate_model_on_mimiciv_mini100():
 
         # Load model state
         if 'model_state' in ckpt:
-            # Fix: Checkpoint has 'model.' and 'llm.' prefixes that need to be stripped
+            # Fix: Checkpoint has TWO copies of weights with different prefixes:
+            #   - 'model.*' = Flamingo model weights (716 keys)
+            #   - 'llm.*' = Duplicate LLM weights (716 keys)
+            # We should ONLY use 'model.*' and strip the prefix
             state_dict = ckpt['model_state']
 
-            # Create new state dict with proper key names
-            # - Strip 'model.' prefix for flamingo model weights
-            # - Keep 'lang_encoder.' prefix for LLM weights (mapped from 'llm.')
+            # Only load keys starting with 'model.' and strip that prefix
             new_state_dict = {}
             for key, value in state_dict.items():
                 if key.startswith('model.'):
                     # Strip 'model.' prefix
                     new_key = key[6:]  # Remove 'model.'
                     new_state_dict[new_key] = value
-                elif key.startswith('llm.'):
-                    # Map 'llm.' to 'lang_encoder.'
-                    new_key = 'lang_encoder' + key[3:]  # Replace 'llm' with 'lang_encoder'
-                    new_state_dict[new_key] = value
-                else:
-                    new_state_dict[key] = value
+                # Ignore 'llm.*' keys - they're duplicates
 
-            logger.info(f"Processed {len(new_state_dict)} state dict keys")
+            logger.info(f"Loaded {len(new_state_dict)} keys from checkpoint (ignored llm.* duplicates)")
             missing_keys, unexpected_keys = flamingo_model.load_state_dict(new_state_dict, strict=False)
             logger.info(f"✓ Loaded model from epoch {ckpt.get('epoch', '?')}")
 
