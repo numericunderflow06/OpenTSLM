@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2025 Stanford University, ETH Zurich, and the project authors (see CONTRIBUTORS.md)
+#
+# SPDX-License-Identifier: MIT
+
 venv
 __pycache__
 .DS_STORE
@@ -7,9 +11,23 @@ raw_data
 data/
 
 # Download artifacts
-**/index.html
 mimic_download.log
 nohup.out
+
+# Log files
+*.log
+training_log.txt
+interleaved_training.log
+
+# Pretrained models and checkpoints
+*.pth
+*.pt
+*.ckpt
+*.bin
+*.safetensors
+checkpoints/
+results/
+results_interleaved/
 
 *.ts
 *.zip
