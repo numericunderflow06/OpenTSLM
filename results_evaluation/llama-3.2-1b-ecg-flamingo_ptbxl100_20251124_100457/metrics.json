@@ -1,0 +1,39 @@
+{
+  "model": "OpenTSLM/llama-3.2-1b-ecg-flamingo",
+  "base_llm": "meta-llama/Llama-3.2-1B",
+  "checkpoint": "softprompt-llama_3_2_1b-ecg.pt",
+  "architecture": "OpenTSLMFlamingo (TimeSeriesFlamingoWithTrainableEncoder)",
+  "max_patches": 1024,
+  "dataset": "ECG-QA PTB-XL (100 questions)",
+  "dataset_class": "ECGQACoTQADataset",
+  "split": "test",
+  "timestamp": "20251124_100457",
+  "device": "cuda",
+  "total_samples": 100,
+  "correct_predictions": 0,
+  "overall_accuracy": 0.0,
+  "question_type_accuracy": {
+    "single-verify": {
+      "correct": 0,
+      "total": 40,
+      "accuracy": 0.0
+    },
+    "single-choose": {
+      "correct": 0,
+      "total": 25,
+      "accuracy": 0.0
+    },
+    "single-query": {
+      "correct": 0,
+      "total": 35,
+      "accuracy": 0.0
+    }
+  },
+  "attribute_type_accuracy": {
+    "": {
+      "correct": 0,
+      "total": 100,
+      "accuracy": 0.0
+    }
+  }
+}

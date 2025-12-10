@@ -1,0 +1,17 @@
+============================================================
+ECG-QA PTB-XL 100-Question Evaluation Results
+============================================================
+
+Model: OpenTSLM/llama-3.2-1b-ecg-flamingo
+Dataset: ECG-QA PTB-XL (test split, 100 questions)
+Timestamp: 20251124_100126
+
+Overall Accuracy: 0.00% (0/100)
+
+Per-Question-Type Accuracy:
+  single-choose: 0.00% (0/25)
+  single-query: 0.00% (0/35)
+  single-verify: 0.00% (0/40)
+
+Per-Attribute-Type Accuracy:
+  : 0.00% (0/100)
