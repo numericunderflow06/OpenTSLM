@@ -158,31 +158,50 @@ class OpenTSLMFlamingo(TimeSeriesLLM):
     def pad_and_apply_batch(
         self, batch: List[Dict[str, any]], include_labels: bool
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        def pad_time_series(batch, max_length=None):
-            """Pad time series to the same length (either max in batch or specified max)"""
+        def pad_time_series(batch, max_length=None, max_channels=None):
+            """Pad time series to the same shape (both channels and length).
+
+            Different datasets have different numbers of channels:
+            - TSQA/M4QA: 1 channel
+            - HARCoT: 3 channels (x, y, z accelerometer)
+            - SleepEDF: Multiple EEG channels
+            - ECG-QA: 12 leads
+
+            This function pads both dimensions to ensure all tensors can be stacked.
+            """
             time_series = [item["time_series"] for item in batch]
 
-            # Determine target length (either specified or max in batch)
+            # Determine target dimensions (either specified or max in batch)
             if max_length is None:
                 max_length = max(ts.shape[1] for ts in time_series)
+            if max_channels is None:
+                max_channels = max(ts.shape[0] for ts in time_series)
 
             padded_series = []
             for ts in time_series:
+                current_channels = ts.shape[0]
                 current_length = ts.shape[1]
+
+                # First, pad the time dimension (dim 1) if needed
                 if current_length < max_length:
-                    # Pad with zeros to reach max_length
-                    # Ensure padding has the same number of dimensions as the time series
-                    padding_shape = list(ts.shape)
-                    padding_shape[1] = max_length - current_length
-                    padding = torch.zeros(
+                    padding_shape = (current_channels, max_length - current_length)
+                    time_padding = torch.zeros(
                         padding_shape, device=ts.device, dtype=ts.dtype
                     )
-                    padded = torch.cat([ts, padding], dim=1)
-                else:
-                    # If already at or exceeding max_length, truncate
-                    padded = ts[:, :max_length]
+                    ts = torch.cat([ts, time_padding], dim=1)
+                elif current_length > max_length:
+                    # Truncate if exceeding max_length
+                    ts = ts[:, :max_length]
 
-                padded_series.append(padded)
+                # Then, pad the channel dimension (dim 0) if needed
+                if current_channels < max_channels:
+                    channel_padding = torch.zeros(
+                        (max_channels - current_channels, max_length),
+                        device=ts.device, dtype=ts.dtype
+                    )
+                    ts = torch.cat([ts, channel_padding], dim=0)
+
+                padded_series.append(ts)
 
             return torch.stack(padded_series)
 
