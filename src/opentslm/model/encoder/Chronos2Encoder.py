@@ -59,10 +59,27 @@ class Chronos2Encoder(TimeSeriesEncoderBase):
         self.use_group_ids = use_group_ids
         
         # Load Chronos-2 model
-        # Note: We only need the encoder part, but we load the full model
-        # and access its encoder component
+        # Note: We need to handle config compatibility issues
         print(f"Loading Chronos-2 model from {model_name}...")
-        self.chronos_model = Chronos2Model.from_pretrained(model_name)
+
+        # First load the config and clean it
+        from transformers import AutoConfig
+        config = AutoConfig.from_pretrained(model_name)
+
+        # Remove problematic fields from chronos_config
+        if hasattr(config, 'chronos_config'):
+            chronos_config = dict(config.chronos_config)
+            # Remove fields that cause issues with current chronos package
+            for field in ['tokenizer_class', 'tokenizer_kwargs']:
+                if field in chronos_config:
+                    del chronos_config[field]
+            config.chronos_config = chronos_config
+
+        # Now load the model with cleaned config
+        self.chronos_model = Chronos2Model.from_pretrained(
+            model_name,
+            config=config
+        )
         
         if device is not None:
             self.chronos_model = self.chronos_model.to(device)
