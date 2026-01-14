@@ -69,6 +69,136 @@ from model_config import (
     WEIGHT_DECAY,
 )
 
+# Convergence detection parameters
+MIN_EPOCHS_BEFORE_STOP = 10  # Don't stop before this many epochs
+RELATIVE_IMPROVEMENT_THRESHOLD = 1e-4  # Stop if relative improvement is below this for patience epochs
+LOSS_SMOOTHING_WINDOW = 3  # Window size for smoothing validation loss
+
+
+class ConvergenceDetector:
+    """
+    Robust convergence detection for training.
+
+    Detects convergence based on:
+    1. Patience: No improvement for N epochs
+    2. Relative improvement: Improvement is below threshold
+    3. Minimum epochs: Don't stop before min_epochs
+    4. Loss smoothing: Use smoothed loss to avoid noise
+    """
+
+    def __init__(
+        self,
+        patience: int = EARLY_STOP_PAT,
+        min_epochs: int = MIN_EPOCHS_BEFORE_STOP,
+        relative_threshold: float = RELATIVE_IMPROVEMENT_THRESHOLD,
+        smoothing_window: int = LOSS_SMOOTHING_WINDOW,
+    ):
+        self.patience = patience
+        self.min_epochs = min_epochs
+        self.relative_threshold = relative_threshold
+        self.smoothing_window = smoothing_window
+
+        self.best_loss = float("inf")
+        self.best_epoch = 0
+        self.epochs_no_improve = 0
+        self.loss_history = []
+        self.converged = False
+        self.convergence_reason = None
+
+    def _get_smoothed_loss(self) -> float:
+        """Get smoothed loss using recent history."""
+        if len(self.loss_history) == 0:
+            return float("inf")
+        window = min(self.smoothing_window, len(self.loss_history))
+        return sum(self.loss_history[-window:]) / window
+
+    def _compute_relative_improvement(self, current_loss: float) -> float:
+        """Compute relative improvement from best loss."""
+        if self.best_loss == float("inf") or self.best_loss == 0:
+            return float("inf")
+        return (self.best_loss - current_loss) / abs(self.best_loss)
+
+    def update(self, epoch: int, val_loss: float) -> dict:
+        """
+        Update convergence state with new validation loss.
+
+        Returns dict with:
+            - is_best: Whether this is a new best
+            - should_stop: Whether training should stop
+            - reason: Reason for stopping (if applicable)
+            - relative_improvement: Relative improvement from best
+            - smoothed_loss: Smoothed validation loss
+        """
+        self.loss_history.append(val_loss)
+        smoothed_loss = self._get_smoothed_loss()
+        relative_improvement = self._compute_relative_improvement(val_loss)
+
+        # Check if this is a new best (with small epsilon for numerical stability)
+        is_best = val_loss + 1e-6 < self.best_loss
+
+        if is_best:
+            self.best_loss = val_loss
+            self.best_epoch = epoch
+            self.epochs_no_improve = 0
+        else:
+            self.epochs_no_improve += 1
+
+        # Determine if we should stop
+        should_stop = False
+        reason = None
+
+        # Only consider stopping after min_epochs
+        if epoch >= self.min_epochs:
+            # Check patience-based stopping
+            if self.epochs_no_improve >= self.patience:
+                should_stop = True
+                reason = f"No improvement for {self.patience} epochs"
+
+            # Check if improvements are too small (plateaued)
+            elif len(self.loss_history) >= self.smoothing_window:
+                recent_improvements = []
+                for i in range(1, min(self.patience, len(self.loss_history))):
+                    if self.loss_history[-i-1] != 0:
+                        imp = (self.loss_history[-i-1] - self.loss_history[-i]) / abs(self.loss_history[-i-1])
+                        recent_improvements.append(imp)
+
+                if recent_improvements and all(abs(imp) < self.relative_threshold for imp in recent_improvements):
+                    should_stop = True
+                    reason = f"Loss plateaued (improvements < {self.relative_threshold:.1e})"
+
+        if should_stop:
+            self.converged = True
+            self.convergence_reason = reason
+
+        return {
+            "is_best": is_best,
+            "should_stop": should_stop,
+            "reason": reason,
+            "relative_improvement": relative_improvement,
+            "smoothed_loss": smoothed_loss,
+            "epochs_no_improve": self.epochs_no_improve,
+        }
+
+    def get_state(self) -> dict:
+        """Get convergence detector state for checkpointing."""
+        return {
+            "best_loss": self.best_loss,
+            "best_epoch": self.best_epoch,
+            "epochs_no_improve": self.epochs_no_improve,
+            "loss_history": self.loss_history,
+            "converged": self.converged,
+            "convergence_reason": self.convergence_reason,
+        }
+
+    def load_state(self, state: dict):
+        """Load convergence detector state from checkpoint."""
+        self.best_loss = state.get("best_loss", float("inf"))
+        self.best_epoch = state.get("best_epoch", 0)
+        self.epochs_no_improve = state.get("epochs_no_improve", 0)
+        self.loss_history = state.get("loss_history", [])
+        self.converged = state.get("converged", False)
+        self.convergence_reason = state.get("convergence_reason", None)
+
 
 # Dataset classes to merge
 MERGED_DATASET_CLASSES = [
@@ -663,9 +793,27 @@ class MergedTrainer:
                 print("Skipping training (eval_only mode)")
             epoch = best_epoch
         else:
-            # Training loop
-            epochs_no_improve = 0
+            # Initialize convergence detector
+            convergence = ConvergenceDetector(
+                patience=EARLY_STOP_PAT,
+                min_epochs=MIN_EPOCHS_BEFORE_STOP,
+                relative_threshold=RELATIVE_IMPROVEMENT_THRESHOLD,
+                smoothing_window=LOSS_SMOOTHING_WINDOW,
+            )
+
+            # Initialize from checkpoint if resuming
+            if best_epoch is not None:
+                convergence.best_loss = best_val_loss
+                convergence.best_epoch = best_epoch
+
             start_epoch = best_epoch + 1 if best_epoch is not None else 1
+
+            if self.rank == 0:
+                print(f"\nConvergence settings:")
+                print(f"  Min epochs before stopping: {MIN_EPOCHS_BEFORE_STOP}")
+                print(f"  Patience: {EARLY_STOP_PAT} epochs")
+                print(f"  Relative improvement threshold: {RELATIVE_IMPROVEMENT_THRESHOLD:.1e}")
+                print()
 
             for epoch in range(start_epoch, num_epochs + 1):
                 if hasattr(train_loader.sampler, "set_epoch"):
@@ -708,49 +856,61 @@ class MergedTrainer:
 
                 avg_val_loss = val_loss / len(val_loader)
 
-                # Synchronize validation loss across all ranks
+                # Synchronize validation loss across all ranks (use average, not sum)
                 if dist.is_initialized():
                     val_loss_tensor = torch.tensor(avg_val_loss, device=self.device)
-                    dist.all_reduce(val_loss_tensor, op=dist.ReduceOp.SUM)
-                    avg_val_loss = val_loss_tensor.item() / self.world_size
+                    dist.all_reduce(val_loss_tensor, op=dist.ReduceOp.AVG)
+                    avg_val_loss = val_loss_tensor.item()
 
                 if self.rank == 0:
                     tqdm.write(f"Epoch {epoch} - val loss: {avg_val_loss:.4f}")
-                    tqdm.write(f"Epoch {epoch} - best loss: {best_val_loss:.4f}")
+                    tqdm.write(f"Epoch {epoch} - best loss: {convergence.best_loss:.4f}")
 
                 self._save_loss_history(epoch, avg_train_loss, avg_val_loss)
 
-                # Early stopping
-                should_save = avg_val_loss + 1e-4 < best_val_loss
-                if dist.is_initialized():
-                    save_tensor = torch.tensor(1 if should_save else 0, device=self.device)
-                    dist.all_reduce(save_tensor, op=dist.ReduceOp.SUM)
-                    should_save = save_tensor.item() > 0
+                # Update convergence detector
+                conv_result = convergence.update(epoch, avg_val_loss)
 
-                if should_save:
-                    best_val_loss = avg_val_loss
-                    epochs_no_improve = 0
+                # Synchronize convergence state across ranks
+                if dist.is_initialized():
+                    is_best_tensor = torch.tensor(1 if conv_result["is_best"] else 0, device=self.device)
+                    should_stop_tensor = torch.tensor(1 if conv_result["should_stop"] else 0, device=self.device)
+                    dist.broadcast(is_best_tensor, src=0)
+                    dist.broadcast(should_stop_tensor, src=0)
+                    is_best = is_best_tensor.item() > 0
+                    should_stop = should_stop_tensor.item() > 0
+                else:
+                    is_best = conv_result["is_best"]
+                    should_stop = conv_result["should_stop"]
+
+                if is_best:
                     self._save_checkpoint(epoch, avg_val_loss, optimizer, scheduler)
                     if self.rank == 0:
                         tqdm.write("New best model saved.\n")
                 else:
-                    epochs_no_improve += 1
                     if self.rank == 0:
-                        tqdm.write(f"No improvement for {epochs_no_improve}/{EARLY_STOP_PAT} epochs.\n")
+                        tqdm.write(f"No improvement for {conv_result['epochs_no_improve']}/{EARLY_STOP_PAT} epochs.\n")
 
-                    if epochs_no_improve >= EARLY_STOP_PAT:
-                        if self.rank == 0:
-                            tqdm.write(f"\nEarly stopping triggered after {epoch} epochs.")
-                        break
+                if should_stop:
+                    if self.rank == 0:
+                        tqdm.write(f"\nConverged after {epoch} epochs: {conv_result['reason']}")
+                    break
 
-                # Synchronize
+                # Synchronize best loss for consistent state
                 if dist.is_initialized():
-                    best_loss_tensor = torch.tensor(best_val_loss, device=self.device)
-                    epochs_tensor = torch.tensor(epochs_no_improve, device=self.device)
+                    best_loss_tensor = torch.tensor(convergence.best_loss, device=self.device)
                     dist.broadcast(best_loss_tensor, src=0)
-                    dist.broadcast(epochs_tensor, src=0)
-                    best_val_loss = best_loss_tensor.item()
-                    epochs_no_improve = int(epochs_tensor.item())
+                    convergence.best_loss = best_loss_tensor.item()
+
+            # Log final convergence state
+            if self.rank == 0:
+                if convergence.converged:
+                    print(f"\nTraining converged: {convergence.convergence_reason}")
+                else:
+                    print(f"\nTraining completed max epochs ({num_epochs})")
+                print(f"Best validation loss: {convergence.best_loss:.4f} at epoch {convergence.best_epoch}")
+
+            best_val_loss = convergence.best_loss
 
         # Load best model and evaluate
         best_epoch, _ = self._load_checkpoint(optimizer, scheduler)
