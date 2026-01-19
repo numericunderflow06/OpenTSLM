@@ -211,6 +211,33 @@ MERGED_DATASET_CLASSES = [
 ]
 
 
+class _UpsampledDataset(Dataset):
+    """
+    Wrapper dataset that upsamples a smaller dataset by repeating samples.
+
+    This creates a virtual dataset of a target size by cycling through
+    the original dataset's indices.
+    """
+
+    def __init__(self, original_dataset: Dataset, target_size: int):
+        """
+        Args:
+            original_dataset: The original dataset to upsample
+            target_size: The desired size of the upsampled dataset
+        """
+        self.original_dataset = original_dataset
+        self.target_size = target_size
+        self.original_size = len(original_dataset)
+
+    def __len__(self) -> int:
+        return self.target_size
+
+    def __getitem__(self, idx: int):
+        # Map index to original dataset using modulo
+        original_idx = idx % self.original_size
+        return self.original_dataset[original_idx]
+
+
 class MergedTrainer:
     """
     Trainer for merged dataset training.
@@ -418,6 +445,54 @@ class MergedTrainer:
                     batch, patch_size=patch_size
                 ),
             )
+
+    def _balance_datasets(
+        self,
+        datasets: List[Dataset],
+        dataset_names: List[str] = None,
+        target_size: int = None,
+    ) -> List[Dataset]:
+        """
+        Balance datasets by upsampling smaller ones to match target size.
+
+        Args:
+            datasets: List of datasets to balance
+            dataset_names: Optional names for logging
+            target_size: Target size for each dataset. If None, uses max size.
+
+        Returns:
+            List of balanced datasets (original datasets are not modified)
+        """
+        if not datasets:
+            return datasets
+
+        # Get original sizes
+        original_sizes = [len(ds) for ds in datasets]
+
+        # Determine target size
+        if target_size is None:
+            target_size = max(original_sizes)
+
+        if self.rank == 0:
+            print(f"\nBalancing datasets to target size: {target_size}")
+            for i, size in enumerate(original_sizes):
+                name = dataset_names[i] if dataset_names else f"Dataset {i}"
+                ratio = target_size / size if size > 0 else 0
+                print(f"  {name}: {size} -> {target_size} (upsample {ratio:.2f}x)")
+
+        balanced_datasets = []
+        for i, ds in enumerate(datasets):
+            original_size = len(ds)
+
+            if original_size >= target_size:
+                # Dataset is already large enough, use as-is
+                balanced_datasets.append(ds)
+            else:
+                # Upsample by creating a wrapper dataset that repeats samples
+                balanced_ds = _UpsampledDataset(ds, target_size)
+                balanced_datasets.append(balanced_ds)
+
+        return balanced_datasets
 
     def _save_checkpoint(self, epoch: int, val_loss: float, optimizer, scheduler):
         """Save model checkpoint."""
@@ -1101,6 +1176,336 @@ class MergedTrainer:
 
         return results
 
+    def train_merged_balanced(
+        self,
+        num_epochs: int = 30,
+        batch_size: int = None,
+        lr_encoder: float = 2e-4,
+        lr_projector: float = 1e-4,
+        lr_base: float = 2e-4,
+        eval_only: bool = False,
+        max_samples_per_dataset: int = None,
+        balance_strategy: str = "max",
+    ) -> Dict[str, Any]:
+        """
+        Train on merged dataset with balanced dataset proportions.
+
+        This version upsamples smaller datasets to match the largest one,
+        addressing dataset imbalance issues (e.g., SleepEDF being only 2% of data).
+
+        Args:
+            num_epochs: Number of training epochs
+            batch_size: Batch size per GPU
+            lr_encoder: Learning rate for encoder
+            lr_projector: Learning rate for projector
+            lr_base: Base learning rate for Flamingo
+            eval_only: Skip training, only run evaluation
+            max_samples_per_dataset: Max samples per dataset (for sanity checks)
+            balance_strategy: "max" to match largest dataset, or int for specific target size
+
+        Returns:
+            Dictionary with training and evaluation metrics
+        """
+        if batch_size is None:
+            batch_size = BATCH_SIZE
+
+        if self.rank == 0:
+            print(f"\n{'='*60}")
+            print(f"Starting BALANCED Merged Training with {self.model_type}")
+            print(f"{'='*60}")
+            print(f"Epochs: {num_epochs}")
+            print(f"Batch size per GPU: {batch_size}")
+            print(f"Balance strategy: {balance_strategy}")
+            if self.world_size > 1:
+                print(f"Effective batch size: {batch_size * self.world_size}")
+            if max_samples_per_dataset:
+                print(f"Max samples per dataset: {max_samples_per_dataset}")
+            print()
+
+        # Create merged datasets
+        eos_token = self._get_model().get_eos_token()
+
+        if self.rank == 0:
+            print("Loading datasets...")
+
+        train_datasets = []
+        val_datasets = []
+        test_datasets = []
+        dataset_names = []
+
+        for dataset_class in MERGED_DATASET_CLASSES:
+            if self.rank == 0:
+                print(f"  Loading {dataset_class.__name__}...")
+
+            train_ds = dataset_class("train", EOS_TOKEN=eos_token)
+            val_ds = dataset_class("validation", EOS_TOKEN=eos_token)
+            test_ds = dataset_class("test", EOS_TOKEN=eos_token)
+
+            # Limit samples if specified (for sanity checks)
+            if max_samples_per_dataset:
+                train_ds.dataset = train_ds.dataset[:max_samples_per_dataset]
+                val_ds.dataset = val_ds.dataset[:max_samples_per_dataset]
+                test_ds.dataset = test_ds.dataset[:max_samples_per_dataset]
+
+            train_datasets.append(train_ds)
+            val_datasets.append(val_ds)
+            test_datasets.append(test_ds)
+            dataset_names.append(dataset_class.__name__)
+
+            if self.rank == 0:
+                print(f"    Train: {len(train_ds)}, Val: {len(val_ds)}, Test: {len(test_ds)}")
+
+        # Show original dataset proportions
+        if self.rank == 0:
+            total_original = sum(len(ds) for ds in train_datasets)
+            print(f"\nOriginal dataset proportions (train):")
+            for name, ds in zip(dataset_names, train_datasets):
+                pct = 100 * len(ds) / total_original
+                print(f"  {name}: {len(ds)} ({pct:.1f}%)")
+
+        # Determine target size for balancing
+        if balance_strategy == "max":
+            target_size = None  # Will use max size
+        else:
+            target_size = int(balance_strategy)
+
+        # Balance training datasets
+        if self.rank == 0:
+            print(f"\nBalancing training datasets...")
+        balanced_train = self._balance_datasets(train_datasets, dataset_names, target_size)
+
+        # Balance validation datasets (proportionally)
+        if self.rank == 0:
+            print(f"\nBalancing validation datasets...")
+        balanced_val = self._balance_datasets(val_datasets, dataset_names, target_size)
+
+        # Test datasets remain unbalanced for fair evaluation
+        if self.rank == 0:
+            print(f"\nTest datasets remain unbalanced for fair evaluation.")
+
+        # Create data loaders
+        train_loader = self._merge_data_loaders(
+            balanced_train,
+            shuffle=True,
+            batch_size=batch_size,
+            patch_size=PATCH_SIZE,
+            distribute_data=self.world_size > 1,
+        )
+
+        val_loader = self._merge_data_loaders(
+            balanced_val,
+            shuffle=False,
+            batch_size=1,
+            patch_size=PATCH_SIZE,
+            distribute_data=False,
+        )
+
+        test_loader = self._merge_data_loaders(
+            test_datasets,
+            shuffle=False,
+            batch_size=1,
+            patch_size=PATCH_SIZE,
+            distribute_data=self.world_size > 1,
+        )
+
+        if self.rank == 0:
+            total_train = sum(len(ds) for ds in balanced_train)
+            total_val = sum(len(ds) for ds in balanced_val)
+            total_test = sum(len(ds) for ds in test_datasets)
+            print(f"\nBalanced dataset sizes:")
+            print(f"  Total Train: {total_train} (balanced)")
+            print(f"  Total Val: {total_val} (balanced)")
+            print(f"  Total Test: {total_test} (original, for fair evaluation)")
+            print()
+
+        # Initialize optimizer
+        optimizer = self._get_optimizer(batch_size, lr_encoder, lr_projector, lr_base)
+
+        # Scheduler
+        total_steps = num_epochs * len(train_loader)
+        warmup_steps = int(WARMUP_FRAC * total_steps)
+        scheduler = get_linear_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=warmup_steps,
+            num_training_steps=total_steps,
+        )
+
+        if self.rank == 0:
+            print(f"Total training steps: {total_steps}")
+            print(f"Warmup steps: {warmup_steps}")
+
+        # Load checkpoint if exists
+        best_epoch, best_val_loss = self._load_checkpoint(optimizer, scheduler, eval_only=eval_only)
+        if best_epoch is not None:
+            if self.rank == 0:
+                print(f"Resuming from epoch {best_epoch} (val_loss: {best_val_loss:.4f})")
+        else:
+            if self.rank == 0:
+                print("Starting fresh training")
+            best_val_loss = float("inf")
+
+        # Skip training if eval_only
+        if eval_only:
+            if self.rank == 0:
+                print("Skipping training (eval_only mode)")
+            epoch = best_epoch
+        else:
+            # Initialize convergence detector
+            convergence = ConvergenceDetector(
+                patience=EARLY_STOP_PAT,
+                min_epochs=MIN_EPOCHS_BEFORE_STOP,
+                relative_threshold=RELATIVE_IMPROVEMENT_THRESHOLD,
+                smoothing_window=LOSS_SMOOTHING_WINDOW,
+            )
+
+            # Initialize from checkpoint if resuming
+            if best_epoch is not None:
+                convergence.best_loss = best_val_loss
+                convergence.best_epoch = best_epoch
+                start_epoch = best_epoch + 1
+            else:
+                start_epoch = 1
+
+            # Training loop
+            for epoch in range(start_epoch, num_epochs + 1):
+                # Training
+                avg_train_loss = self._train_epoch(train_loader, optimizer, scheduler, epoch)
+
+                # Validation
+                avg_val_loss = self._validate(val_loader, epoch)
+
+                # Record in history
+                self._save_loss_history(epoch, avg_train_loss, avg_val_loss)
+
+                # Check convergence (only on rank 0)
+                if self.rank == 0:
+                    conv_result = convergence.check(avg_val_loss, epoch)
+                    # Broadcast to other processes
+                    if dist.is_initialized():
+                        conv_tensor = torch.tensor(
+                            [float(conv_result["is_best"]), float(conv_result["should_stop"])],
+                            device=self.device,
+                        )
+                        dist.broadcast(conv_tensor, src=0)
+                    is_best = conv_result["is_best"]
+                    should_stop = conv_result["should_stop"]
+                else:
+                    if dist.is_initialized():
+                        conv_tensor = torch.tensor([0.0, 0.0], device=self.device)
+                        dist.broadcast(conv_tensor, src=0)
+                        is_best = conv_tensor[0].item() > 0.5
+                        should_stop = conv_tensor[1].item() > 0.5
+                    else:
+                        is_best = conv_result["is_best"]
+                        should_stop = conv_result["should_stop"]
+
+                if is_best:
+                    self._save_checkpoint(epoch, avg_val_loss, optimizer, scheduler)
+                    if self.rank == 0:
+                        tqdm.write("New best model saved.\n")
+                else:
+                    if self.rank == 0:
+                        tqdm.write(f"No improvement for {conv_result['epochs_no_improve']}/{EARLY_STOP_PAT} epochs.\n")
+
+                if should_stop:
+                    if self.rank == 0:
+                        tqdm.write(f"\nConverged after {epoch} epochs: {conv_result['reason']}")
+                    break
+
+                # Synchronize best loss for consistent state
+                if dist.is_initialized():
+                    best_loss_tensor = torch.tensor(convergence.best_loss, device=self.device)
+                    dist.broadcast(best_loss_tensor, src=0)
+                    convergence.best_loss = best_loss_tensor.item()
+
+            # Log final convergence state
+            if self.rank == 0:
+                if convergence.converged:
+                    print(f"\nTraining converged: {convergence.convergence_reason}")
+                else:
+                    print(f"\nTraining completed max epochs ({num_epochs})")
+                print(f"Best validation loss: {convergence.best_loss:.4f} at epoch {convergence.best_epoch}")
+
+            best_val_loss = convergence.best_loss
+
+        # Load best model and evaluate
+        best_epoch, _ = self._load_checkpoint(optimizer, scheduler)
+        if best_epoch is not None and self.rank == 0:
+            print(f"Loaded best checkpoint from epoch {best_epoch} for evaluation.")
+
+        # Evaluate on merged test set (original, unbalanced for fair evaluation)
+        if self.rank == 0:
+            print(f"\n{'='*60}")
+            print("Evaluating on merged test set (original proportions)...")
+            print(f"{'='*60}")
+
+        merged_metrics = self._evaluate(
+            test_loader,
+            "merged_test",
+            metric_func=self._calculate_merged_accuracy,
+            epoch=best_epoch,
+        )
+
+        # Evaluate on TimeSeriesExam1
+        if self.rank == 0:
+            print(f"\n{'='*60}")
+            print("Evaluating on TimeSeriesExam1 benchmark...")
+            print(f"{'='*60}")
+
+        tsexam_test = TimeSeriesExam1QADataset("test", EOS_TOKEN=eos_token)
+        if max_samples_per_dataset:
+            tsexam_test.dataset = tsexam_test.dataset[:max_samples_per_dataset]
+
+        tsexam_loader = self._merge_data_loaders(
+            [tsexam_test],
+            shuffle=False,
+            batch_size=1,
+            patch_size=PATCH_SIZE,
+            distribute_data=self.world_size > 1,
+        )
+
+        tsexam_metrics = self._evaluate(
+            tsexam_loader,
+            "timeseriesexam1",
+            metric_func=lambda preds, golds: {"accuracy": self._calculate_accuracy(preds, golds)},
+            epoch=best_epoch,
+        )
+
+        # Combine results
+        results = {
+            "merged_test": merged_metrics,
+            "timeseriesexam1": tsexam_metrics,
+            "best_epoch": best_epoch,
+            "best_val_loss": best_val_loss,
+            "balanced_training": True,
+            "balance_strategy": balance_strategy,
+        }
+
+        # Save overall results
+        if self.rank == 0:
+            results_file = os.path.join(self.results_dir, "results", "final_results_balanced.json")
+            with open(results_file, "w") as f:
+                json.dump(results, f, indent=2)
+
+            print(f"\n{'='*60}")
+            print("Balanced Training Complete!")
+            print(f"{'='*60}")
+            print(f"Results saved to: {self.results_dir}/results/")
+            print(f"Best epoch: {best_epoch}")
+            print(f"Best val loss: {best_val_loss:.4f}")
+            if "mcq_accuracy" in merged_metrics:
+                print(f"Merged Test MCQ Accuracy: {merged_metrics['mcq_accuracy']:.4f} "
+                      f"({merged_metrics['mcq_correct']}/{merged_metrics['mcq_total']} MCQ samples)")
+            if "cot_accuracy" in merged_metrics:
+                print(f"Merged Test CoT Accuracy: {merged_metrics['cot_accuracy']:.4f} "
+                      f"({merged_metrics['cot_correct']}/{merged_metrics['cot_total']} CoT samples)")
+            if "overall_accuracy" in merged_metrics:
+                print(f"Merged Test Overall Accuracy: {merged_metrics['overall_accuracy']:.4f}")
+            if "accuracy" in tsexam_metrics:
+                print(f"TimeSeriesExam1 Accuracy: {tsexam_metrics['accuracy']:.4f}")
+
+        return results
+
 
 def main():
     parser = argparse.ArgumentParser(description="Merged Training for OpenTSLM Models")
@@ -1168,6 +1573,18 @@ def main():
     parser.add_argument(
         "--verbose", default=False, action="store_true", help="Enable verbose logging"
     )
+    parser.add_argument(
+        "--balanced",
+        default=False,
+        action="store_true",
+        help="Use balanced training (upsample smaller datasets to match largest)"
+    )
+    parser.add_argument(
+        "--balance_strategy",
+        type=str,
+        default="max",
+        help="Balance strategy: 'max' to match largest dataset size, or an integer target size"
+    )
 
     args = parser.parse_args()
 
@@ -1184,12 +1601,21 @@ def main():
         llm_id=args.llm_id,
     )
 
-    results = trainer.train_merged(
-        num_epochs=args.num_epochs,
-        batch_size=args.batch_size,
-        eval_only=args.eval_only,
-        max_samples_per_dataset=args.max_samples_per_dataset,
-    )
+    if args.balanced:
+        results = trainer.train_merged_balanced(
+            num_epochs=args.num_epochs,
+            batch_size=args.batch_size,
+            eval_only=args.eval_only,
+            max_samples_per_dataset=args.max_samples_per_dataset,
+            balance_strategy=args.balance_strategy,
+        )
+    else:
+        results = trainer.train_merged(
+            num_epochs=args.num_epochs,
+            batch_size=args.batch_size,
+            eval_only=args.eval_only,
+            max_samples_per_dataset=args.max_samples_per_dataset,
+        )
 
     logger.info("Final Results:")
     logger.info("=" * 40)
