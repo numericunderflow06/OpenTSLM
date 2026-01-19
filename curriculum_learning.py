@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "src"
 import json
 import os as _os
 import argparse
+import re
 from typing import List, Optional, Dict, Any, Callable
 from time_series_datasets.TSQADataset import TSQADataset
 from time_series_datasets.m4.M4QADataset import M4QADataset
@@ -690,21 +691,42 @@ class CurriculumTrainer:
         except Exception as e:
             raise RuntimeError(f"Failed to load previous stage model: {e}")
 
+    def _calculate_accuracy_baseline(self, gold: str, prediction: str) -> int:
+        """
+        Original OpenTSLM baseline evaluation logic from evaluate_tsqa.py.
+
+        This uses:
+        - First 3 characters comparison only
+        - Lowercase, case-insensitive matching
+        - Exact match after extracting answer
+        """
+        # Clean up strings for comparison
+        gt_clean = gold.replace("<|end_of_text|>", "").lower().strip()
+        pred_clean = prediction.lower().strip()
+
+        # Only compare the first 3 characters (e.g., "(a)", "(b)", "(c)")
+        gt_clean = gt_clean[:3]
+        pred_clean = pred_clean[:3]
+
+        # Extract the actual answer from the prediction (everything after "Answer:")
+        answer_match = re.search(r'answer:\s*(.+)', pred_clean, re.IGNORECASE)
+        if answer_match:
+            pred_answer = answer_match.group(1).strip()[:3]
+        else:
+            pred_answer = pred_clean
+
+        # Calculate accuracy (exact match)
+        return int(gt_clean == pred_answer)
+
     def _calculate_accuracy(
         self, predictions: List[str], gold_answers: List[str]
     ) -> float:
-        """Calculate accuracy for MCQ tasks."""
+        """Calculate accuracy for MCQ tasks using original baseline logic."""
         correct = 0
         total = len(predictions)
 
         for pred, gold in zip(predictions, gold_answers):
-            # Clean up predictions and gold answers
-            pred_clean = pred.strip()
-            gold_clean = gold.strip()
-
-            # Check if gold starts with the cleaned prediction (more robust matching)
-            if gold_clean.startswith(pred_clean) or pred_clean == gold_clean:
-                correct += 1
+            correct += self._calculate_accuracy_baseline(gold, pred)
 
         return correct / total if total > 0 else 0.0
 

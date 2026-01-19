@@ -30,6 +30,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "src"
 
 import json
 import argparse
+import re
 from typing import List, Optional, Dict, Any, Callable
 from time_series_datasets.TSQADataset import TSQADataset
 from time_series_datasets.m4.M4QADataset import M4QADataset
@@ -507,18 +508,130 @@ class MergedTrainer:
             return checkpoint.get("epoch", "?"), checkpoint.get("val_loss", float("inf"))
         return None, float("inf")
 
+    def _is_mcq_gold(self, gold: str) -> bool:
+        """
+        Check if this is an MCQ task based on gold answer format.
+        MCQ tasks have gold answers starting with option letters like "(a)", "(b)", etc.
+        """
+        cleaned = gold.replace("<|end_of_text|>", "").strip()
+        return bool(re.match(r'^\([a-h]\)', cleaned, re.IGNORECASE))
+
+    def _calculate_accuracy_baseline(self, gold: str, prediction: str) -> int:
+        """
+        Original OpenTSLM baseline evaluation logic from evaluate_tsqa.py.
+
+        This uses:
+        - First 3 characters comparison only
+        - Lowercase, case-insensitive matching
+        - Exact match after extracting answer
+        """
+        # Clean up strings for comparison
+        gt_clean = gold.replace("<|end_of_text|>", "").lower().strip()
+        pred_clean = prediction.lower().strip()
+
+        # Only compare the first 3 characters (e.g., "(a)", "(b)", "(c)")
+        gt_clean = gt_clean[:3]
+        pred_clean = pred_clean[:3]
+
+        # Extract the actual answer from the prediction (everything after "Answer:")
+        answer_match = re.search(r'answer:\s*(.+)', pred_clean, re.IGNORECASE)
+        if answer_match:
+            pred_answer = answer_match.group(1).strip()[:3]
+        else:
+            pred_answer = pred_clean
+
+        # Calculate accuracy (exact match)
+        return int(gt_clean == pred_answer)
+
     def _calculate_accuracy(self, predictions: List[str], gold_answers: List[str]) -> float:
-        """Calculate accuracy for MCQ tasks."""
+        """Calculate accuracy for MCQ tasks using original baseline logic."""
         correct = 0
         total = len(predictions)
 
         for pred, gold in zip(predictions, gold_answers):
-            pred_clean = pred.strip()
-            gold_clean = gold.strip()
-            if gold_clean.startswith(pred_clean) or pred_clean == gold_clean:
-                correct += 1
+            correct += self._calculate_accuracy_baseline(gold, pred)
 
         return correct / total if total > 0 else 0.0
+
+    def _is_cot_gold(self, gold: str) -> bool:
+        """
+        Check if this is a CoT task based on gold answer containing "Answer:" pattern.
+        """
+        return "Answer:" in gold and not self._is_mcq_gold(gold)
+
+    def _extract_cot_label(self, text: str) -> str:
+        """
+        Extract the label after "Answer:" from CoT response.
+        Following the original evaluate_har.py and evaluate_sleep_cot.py logic.
+        """
+        if text is None:
+            return ""
+
+        text = text.strip().replace("<|end_of_text|>", "").strip()
+
+        # Find the last occurrence of 'Answer:' (case-insensitive)
+        matches = list(re.finditer(r'answer:\s*', text, re.IGNORECASE))
+        if matches:
+            start = matches[-1].end()
+            label = text[start:].strip()
+        else:
+            words = text.split()
+            label = words[-1] if words else ""
+
+        # Remove trailing punctuation
+        label = re.sub(r'[\.,;:!?]+$', '', label)
+        return label.lower().strip()
+
+    def _calculate_cot_accuracy(self, gold: str, prediction: str) -> int:
+        """Evaluate CoT task by comparing extracted labels."""
+        gold_label = self._extract_cot_label(gold)
+        pred_label = self._extract_cot_label(prediction)
+        return int(gold_label == pred_label)
+
+    def _calculate_merged_accuracy(
+        self, predictions: List[str], gold_answers: List[str]
+    ) -> Dict[str, Any]:
+        """
+        Calculate accuracy for merged test set.
+
+        Evaluates:
+        - MCQ samples: First 3 chars comparison (original TSQA baseline)
+        - CoT samples: Extract label after "Answer:" and compare
+        - Captioning samples: Counted but no accuracy metric
+        """
+        mcq_correct = 0
+        mcq_total = 0
+        cot_correct = 0
+        cot_total = 0
+        captioning_total = 0
+
+        for pred, gold in zip(predictions, gold_answers):
+            if self._is_mcq_gold(gold):
+                mcq_total += 1
+                mcq_correct += self._calculate_accuracy_baseline(gold, pred)
+            elif self._is_cot_gold(gold):
+                cot_total += 1
+                cot_correct += self._calculate_cot_accuracy(gold, pred)
+            else:
+                captioning_total += 1
+
+        mcq_accuracy = mcq_correct / mcq_total if mcq_total > 0 else 0.0
+        cot_accuracy = cot_correct / cot_total if cot_total > 0 else 0.0
+
+        total_eval = mcq_total + cot_total
+        total_correct = mcq_correct + cot_correct
+        overall_accuracy = total_correct / total_eval if total_eval > 0 else 0.0
+
+        return {
+            "mcq_accuracy": mcq_accuracy,
+            "mcq_correct": mcq_correct,
+            "mcq_total": mcq_total,
+            "cot_accuracy": cot_accuracy,
+            "cot_correct": cot_correct,
+            "cot_total": cot_total,
+            "overall_accuracy": overall_accuracy,
+            "captioning_total": captioning_total,
+        }
 
     def _evaluate(
         self,
@@ -926,7 +1039,7 @@ class MergedTrainer:
         merged_metrics = self._evaluate(
             test_loader,
             "merged_test",
-            metric_func=None,  # Loss only for merged test
+            metric_func=self._calculate_merged_accuracy,
             epoch=best_epoch,
         )
 
@@ -975,6 +1088,14 @@ class MergedTrainer:
             print(f"Results saved to: {self.results_dir}/results/")
             print(f"Best epoch: {best_epoch}")
             print(f"Best val loss: {best_val_loss:.4f}")
+            if "mcq_accuracy" in merged_metrics:
+                print(f"Merged Test MCQ Accuracy: {merged_metrics['mcq_accuracy']:.4f} "
+                      f"({merged_metrics['mcq_correct']}/{merged_metrics['mcq_total']} MCQ samples)")
+            if "cot_accuracy" in merged_metrics:
+                print(f"Merged Test CoT Accuracy: {merged_metrics['cot_accuracy']:.4f} "
+                      f"({merged_metrics['cot_correct']}/{merged_metrics['cot_total']} CoT samples)")
+            if "overall_accuracy" in merged_metrics:
+                print(f"Merged Test Overall Accuracy: {merged_metrics['overall_accuracy']:.4f}")
             if "accuracy" in tsexam_metrics:
                 print(f"TimeSeriesExam1 Accuracy: {tsexam_metrics['accuracy']:.4f}")
 
