@@ -494,8 +494,17 @@ class MergedTrainer:
 
         return balanced_datasets
 
-    def _save_checkpoint(self, epoch: int, val_loss: float, optimizer, scheduler):
-        """Save model checkpoint."""
+    def _save_checkpoint(self, epoch: int, val_loss: float, optimizer, scheduler, save_as_best: bool = True, save_epoch_checkpoint: bool = False):
+        """Save model checkpoint.
+
+        Args:
+            epoch: Current epoch number
+            val_loss: Validation loss
+            optimizer: Optimizer state to save
+            scheduler: Scheduler state to save
+            save_as_best: If True, save as best_model.pt
+            save_epoch_checkpoint: If True, also save as epoch_{N}.pt
+        """
         checkpoint_dir = os.path.join(self.results_dir, "checkpoints")
 
         if dist.is_initialized() and self.rank != 0:
@@ -525,10 +534,19 @@ class MergedTrainer:
                 "epoch": epoch,
             }
 
-        checkpoint_path = os.path.join(checkpoint_dir, "best_model.pt")
-        torch.save(checkpoint, checkpoint_path)
-        if self.rank == 0:
-            print(f"Saved checkpoint to {checkpoint_path}")
+        # Save as best model if requested
+        if save_as_best:
+            checkpoint_path = os.path.join(checkpoint_dir, "best_model.pt")
+            torch.save(checkpoint, checkpoint_path)
+            if self.rank == 0:
+                print(f"Saved best checkpoint to {checkpoint_path}")
+
+        # Save epoch checkpoint if requested
+        if save_epoch_checkpoint:
+            epoch_checkpoint_path = os.path.join(checkpoint_dir, f"epoch_{epoch}.pt")
+            torch.save(checkpoint, epoch_checkpoint_path)
+            if self.rank == 0:
+                print(f"Saved epoch checkpoint to {epoch_checkpoint_path}")
 
     def _save_loss_history(self, epoch: int, train_loss: float, val_loss: float):
         """Save loss history to a file."""
@@ -1071,8 +1089,10 @@ class MergedTrainer:
                     is_best = conv_result["is_best"]
                     should_stop = conv_result["should_stop"]
 
+                # Always save epoch checkpoint for recovery
+                self._save_checkpoint(epoch, avg_val_loss, optimizer, scheduler,
+                                      save_as_best=is_best, save_epoch_checkpoint=True)
                 if is_best:
-                    self._save_checkpoint(epoch, avg_val_loss, optimizer, scheduler)
                     if self.rank == 0:
                         tqdm.write("New best model saved.\n")
                 else:
@@ -1399,8 +1419,10 @@ class MergedTrainer:
                         is_best = conv_result["is_best"]
                         should_stop = conv_result["should_stop"]
 
+                # Always save epoch checkpoint for recovery
+                self._save_checkpoint(epoch, avg_val_loss, optimizer, scheduler,
+                                      save_as_best=is_best, save_epoch_checkpoint=True)
                 if is_best:
-                    self._save_checkpoint(epoch, avg_val_loss, optimizer, scheduler)
                     if self.rank == 0:
                         tqdm.write("New best model saved.\n")
                 else:
