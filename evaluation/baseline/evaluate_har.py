@@ -37,16 +37,8 @@ def extract_label_from_prediction(prediction: str) -> str:
 
 def evaluate_har_acc(ground_truth: str, prediction: str) -> Dict[str, Any]:
     """
-    <<<<<<< HEAD
-    <<<<<<< HEAD
-        Evaluate HARAccQADataset predictions against ground truth.
-    =======
-        Evaluate HARCoTQADataset predictions against ground truth.
-    >>>>>>> RealLast/ECG-QA-Integration
-    =======
-        Evaluate HARCoTQADataset predictions against ground truth.
-    >>>>>>> main
-        Extracts the label from the end of the model's output and compares to ground truth.
+    Evaluate HARCoTQADataset predictions against ground truth.
+    Extracts the label from the end of the model's output and compares to ground truth.
     """
     gt_clean = ground_truth.lower().strip()
     pred_label = extract_label_from_prediction(prediction)

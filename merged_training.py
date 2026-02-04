@@ -134,8 +134,8 @@ class ConvergenceDetector:
         smoothed_loss = self._get_smoothed_loss()
         relative_improvement = self._compute_relative_improvement(val_loss)
 
-        # Check if this is a new best (with small epsilon for numerical stability)
-        is_best = val_loss + 1e-6 < self.best_loss
+        # Check if this is a new best (matching original curriculum_learning.py tolerance)
+        is_best = val_loss + 1e-4 < self.best_loss
 
         if is_best:
             self.best_loss = val_loss
@@ -148,24 +148,10 @@ class ConvergenceDetector:
         should_stop = False
         reason = None
 
-        # Only consider stopping after min_epochs
-        if epoch >= self.min_epochs:
-            # Check patience-based stopping
-            if self.epochs_no_improve >= self.patience:
-                should_stop = True
-                reason = f"No improvement for {self.patience} epochs"
-
-            # Check if improvements are too small (plateaued)
-            elif len(self.loss_history) >= self.smoothing_window:
-                recent_improvements = []
-                for i in range(1, min(self.patience, len(self.loss_history))):
-                    if self.loss_history[-i-1] != 0:
-                        imp = (self.loss_history[-i-1] - self.loss_history[-i]) / abs(self.loss_history[-i-1])
-                        recent_improvements.append(imp)
-
-                if recent_improvements and all(abs(imp) < self.relative_threshold for imp in recent_improvements):
-                    should_stop = True
-                    reason = f"Loss plateaued (improvements < {self.relative_threshold:.1e})"
+        # Check patience-based stopping (matching original curriculum_learning.py behavior)
+        if self.epochs_no_improve >= self.patience:
+            should_stop = True
+            reason = f"No improvement for {self.patience} epochs"
 
         if should_stop:
             self.converged = True
@@ -649,8 +635,9 @@ class MergedTrainer:
     def _is_cot_gold(self, gold: str) -> bool:
         """
         Check if this is a CoT task based on gold answer containing "Answer:" pattern.
+        Case-insensitive to handle variations in rationale formatting.
         """
-        return "Answer:" in gold and not self._is_mcq_gold(gold)
+        return bool(re.search(r'answer:', gold, re.IGNORECASE)) and not self._is_mcq_gold(gold)
 
     def _extract_cot_label(self, text: str) -> str:
         """
@@ -661,6 +648,8 @@ class MergedTrainer:
             return ""
 
         text = text.strip().replace("<|end_of_text|>", "").strip()
+        # Also remove other special end tokens (matching original ECG evaluation)
+        text = re.sub(r'<\|.*?\|>|<eos>$', '', text).strip()
 
         # Find the last occurrence of 'Answer:' (case-insensitive)
         matches = list(re.finditer(r'answer:\s*', text, re.IGNORECASE))
@@ -668,8 +657,13 @@ class MergedTrainer:
             start = matches[-1].end()
             label = text[start:].strip()
         else:
+            # Fallback: handle multi-word labels (e.g., sleep stages like "REM sleep")
+            # following original evaluate_sleep_cot.py logic
             words = text.split()
-            label = words[-1] if words else ""
+            if len(words) >= 2 and words[-2].lower() in ['non-rem', 'rem']:
+                label = ' '.join(words[-2:])
+            else:
+                label = words[-1] if words else ""
 
         # Remove trailing punctuation
         label = re.sub(r'[\.,;:!?]+$', '', label)
@@ -831,6 +825,31 @@ class MergedTrainer:
             return self.model.module
         return self.model
 
+    def _enable_lora_if_needed(self):
+        """Enable LoRA for OpenTSLMSP models.
+
+        In the original curriculum learning, LoRA is enabled for CoT stages (3+).
+        Since merged training includes CoT datasets, LoRA should be enabled.
+        """
+        if self.model_type != "OpenTSLMSP":
+            return
+
+        model = self._get_model()
+        if not getattr(model, "lora_enabled", False):
+            if self.rank == 0:
+                print("Enabling LoRA for merged training (includes CoT datasets)")
+            try:
+                model.enable_lora(lora_r=16, lora_alpha=32, lora_dropout=0.0)
+                if self.rank == 0:
+                    print("LoRA enabled successfully")
+            except Exception as e:
+                if self.rank == 0:
+                    print(f"Failed to enable LoRA: {e}")
+                    print("Continuing without LoRA...")
+        else:
+            if self.rank == 0:
+                print("LoRA already enabled")
+
     def _should_use_distributed(self) -> bool:
         """Check if distributed training should be used."""
         return ("WORLD_SIZE" in os.environ and int(os.environ["WORLD_SIZE"]) > 1) or (
@@ -966,6 +985,9 @@ class MergedTrainer:
             print(f"  Total Val: {total_val}")
             print(f"  Total Test: {total_test}")
             print()
+
+        # Enable LoRA if needed (must be before optimizer init to include LoRA params)
+        self._enable_lora_if_needed()
 
         # Initialize optimizer
         optimizer = self._get_optimizer(batch_size, lr_encoder, lr_projector, lr_base)
@@ -1338,6 +1360,9 @@ class MergedTrainer:
             print(f"  Total Test: {total_test} (original, for fair evaluation)")
             print()
 
+        # Enable LoRA if needed (must be before optimizer init to include LoRA params)
+        self._enable_lora_if_needed()
+
         # Initialize optimizer
         optimizer = self._get_optimizer(batch_size, lr_encoder, lr_projector, lr_base)
 
@@ -1388,36 +1413,72 @@ class MergedTrainer:
 
             # Training loop
             for epoch in range(start_epoch, num_epochs + 1):
+                if hasattr(train_loader.sampler, "set_epoch"):
+                    train_loader.sampler.set_epoch(epoch)
+
                 # Training
-                avg_train_loss = self._train_epoch(train_loader, optimizer, scheduler, epoch)
+                self.model.train()
+                running_loss = 0.0
+                prog = tqdm(
+                    train_loader,
+                    desc=f"Epoch {epoch}/{num_epochs}",
+                    disable=self.rank != 0,
+                )
+
+                for i, batch in enumerate(prog):
+                    optimizer.zero_grad()
+                    loss = self._get_model().compute_loss(batch)
+                    loss.backward()
+                    clip_grad_norm_(self._get_model().parameters(), GRAD_CLIP_NORM)
+                    optimizer.step()
+                    scheduler.step()
+
+                    running_loss += loss.item()
+                    if self.rank == 0:
+                        prog.set_postfix(
+                            loss=f"{loss.item():.4f}",
+                            lr=f"{scheduler.get_last_lr()[0]:.2e}",
+                        )
+
+                avg_train_loss = running_loss / len(train_loader)
+                if self.rank == 0:
+                    tqdm.write(f"Epoch {epoch} - train loss: {avg_train_loss:.4f}")
 
                 # Validation
-                avg_val_loss = self._validate(val_loader, epoch)
+                val_loss = 0.0
+                self.model.eval()
+                with torch.no_grad():
+                    for batch in tqdm(val_loader, desc="Validating", disable=self.rank != 0):
+                        val_loss += self._get_model().compute_loss(batch).item()
 
-                # Record in history
+                avg_val_loss = val_loss / len(val_loader)
+
+                # Synchronize validation loss across all ranks (use average, not sum)
+                if dist.is_initialized():
+                    val_loss_tensor = torch.tensor(avg_val_loss, device=self.device)
+                    dist.all_reduce(val_loss_tensor, op=dist.ReduceOp.AVG)
+                    avg_val_loss = val_loss_tensor.item()
+
+                if self.rank == 0:
+                    tqdm.write(f"Epoch {epoch} - val loss: {avg_val_loss:.4f}")
+                    tqdm.write(f"Epoch {epoch} - best loss: {convergence.best_loss:.4f}")
+
                 self._save_loss_history(epoch, avg_train_loss, avg_val_loss)
 
-                # Check convergence (only on rank 0)
-                if self.rank == 0:
-                    conv_result = convergence.check(avg_val_loss, epoch)
-                    # Broadcast to other processes
-                    if dist.is_initialized():
-                        conv_tensor = torch.tensor(
-                            [float(conv_result["is_best"]), float(conv_result["should_stop"])],
-                            device=self.device,
-                        )
-                        dist.broadcast(conv_tensor, src=0)
+                # Update convergence detector
+                conv_result = convergence.update(epoch, avg_val_loss)
+
+                # Synchronize convergence state across ranks
+                if dist.is_initialized():
+                    is_best_tensor = torch.tensor(1 if conv_result["is_best"] else 0, device=self.device)
+                    should_stop_tensor = torch.tensor(1 if conv_result["should_stop"] else 0, device=self.device)
+                    dist.broadcast(is_best_tensor, src=0)
+                    dist.broadcast(should_stop_tensor, src=0)
+                    is_best = is_best_tensor.item() > 0
+                    should_stop = should_stop_tensor.item() > 0
+                else:
                     is_best = conv_result["is_best"]
                     should_stop = conv_result["should_stop"]
-                else:
-                    if dist.is_initialized():
-                        conv_tensor = torch.tensor([0.0, 0.0], device=self.device)
-                        dist.broadcast(conv_tensor, src=0)
-                        is_best = conv_tensor[0].item() > 0.5
-                        should_stop = conv_tensor[1].item() > 0.5
-                    else:
-                        is_best = conv_result["is_best"]
-                        should_stop = conv_result["should_stop"]
 
                 # Always save epoch checkpoint for recovery
                 self._save_checkpoint(epoch, avg_val_loss, optimizer, scheduler,
