@@ -153,6 +153,11 @@ class ConvergenceDetector:
             should_stop = True
             reason = f"No improvement for {self.patience} epochs"
 
+        # Don't stop before minimum epochs
+        if epoch < self.min_epochs:
+            should_stop = False
+            reason = None
+
         if should_stop:
             self.converged = True
             self.convergence_reason = reason
@@ -222,6 +227,119 @@ class _UpsampledDataset(Dataset):
         # Map index to original dataset using modulo
         original_idx = idx % self.original_size
         return self.original_dataset[original_idx]
+
+
+class DatasetGroupedBatchSampler:
+    """
+    Batch sampler ensuring all samples in a batch come from the same
+    sub-dataset within a ConcatDataset.  This prevents cross-dataset
+    channel zero-padding that corrupts encoder features (different datasets
+    have different channel counts: 1 for TSQA/M4/Sleep, 3 for HAR, 12 for ECG).
+
+    Batches are formed within each dataset group, then their ORDER is
+    shuffled so the model sees batches from different datasets in random order.
+    """
+
+    def __init__(self, concat_dataset: ConcatDataset, batch_size: int, shuffle: bool = True):
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+
+        self.groups: List[List[int]] = []
+        offset = 0
+        for ds in concat_dataset.datasets:
+            self.groups.append(list(range(offset, offset + len(ds))))
+            offset += len(ds)
+
+    def __iter__(self):
+        g = torch.Generator()
+        g.manual_seed(int(torch.empty((), dtype=torch.int64).random_().item()))
+
+        all_batches: List[List[int]] = []
+        for group_indices in self.groups:
+            if self.shuffle:
+                perm = torch.randperm(len(group_indices), generator=g).tolist()
+                indices = [group_indices[i] for i in perm]
+            else:
+                indices = list(group_indices)
+
+            for i in range(0, len(indices), self.batch_size):
+                all_batches.append(indices[i : i + self.batch_size])
+
+        if self.shuffle:
+            perm = torch.randperm(len(all_batches), generator=g).tolist()
+            all_batches = [all_batches[i] for i in perm]
+
+        yield from all_batches
+
+    def __len__(self):
+        return sum(
+            (len(g) + self.batch_size - 1) // self.batch_size for g in self.groups
+        )
+
+
+class DistributedDatasetGroupedBatchSampler:
+    """
+    Distributed version of DatasetGroupedBatchSampler.
+    Each rank gets a disjoint subset of batches while maintaining
+    the dataset-grouping invariant within each batch.
+    """
+
+    def __init__(
+        self,
+        concat_dataset: ConcatDataset,
+        batch_size: int,
+        num_replicas: int,
+        rank: int,
+        shuffle: bool = True,
+    ):
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.epoch = 0
+
+        self.groups: List[List[int]] = []
+        offset = 0
+        for ds in concat_dataset.datasets:
+            self.groups.append(list(range(offset, offset + len(ds))))
+            offset += len(ds)
+
+    def set_epoch(self, epoch: int):
+        self.epoch = epoch
+
+    def __iter__(self):
+        g = torch.Generator()
+        g.manual_seed(self.epoch)
+
+        all_batches: List[List[int]] = []
+        for group_indices in self.groups:
+            if self.shuffle:
+                perm = torch.randperm(len(group_indices), generator=g).tolist()
+                indices = [group_indices[i] for i in perm]
+            else:
+                indices = list(group_indices)
+
+            for i in range(0, len(indices), self.batch_size):
+                all_batches.append(indices[i : i + self.batch_size])
+
+        if self.shuffle:
+            perm = torch.randperm(len(all_batches), generator=g).tolist()
+            all_batches = [all_batches[i] for i in perm]
+
+        # Pad so every rank gets the same number of batches
+        remainder = len(all_batches) % self.num_replicas
+        if remainder:
+            all_batches += all_batches[: self.num_replicas - remainder]
+
+        yield from all_batches[self.rank :: self.num_replicas]
+
+    def __len__(self):
+        total = sum(
+            (len(g) + self.batch_size - 1) // self.batch_size for g in self.groups
+        )
+        if total % self.num_replicas:
+            total += self.num_replicas - (total % self.num_replicas)
+        return total // self.num_replicas
 
 
 class MergedTrainer:
@@ -406,30 +524,46 @@ class MergedTrainer:
         batch_size: int,
         patch_size: int,
         distribute_data: bool = False,
+        group_by_dataset: bool = False,
     ) -> DataLoader:
-        """Create a merged data loader from multiple datasets."""
+        """Create a merged data loader from multiple datasets.
+
+        Args:
+            group_by_dataset: When True, every batch contains samples from a
+                single sub-dataset.  This prevents cross-dataset channel
+                zero-padding that would corrupt encoder features (different
+                datasets have 1, 3, or 12 channels).
+        """
         merged_ds = ConcatDataset(datasets)
 
+        collate_fn = lambda batch: extend_time_series_to_match_patch_size_and_aggregate(
+            batch, patch_size=patch_size
+        )
+
+        # Grouped batching: each batch draws from one sub-dataset only
+        if group_by_dataset and len(datasets) > 1:
+            if distribute_data and dist.is_initialized():
+                batch_sampler = DistributedDatasetGroupedBatchSampler(
+                    merged_ds, batch_size,
+                    num_replicas=self.world_size, rank=self.rank, shuffle=shuffle,
+                )
+            else:
+                batch_sampler = DatasetGroupedBatchSampler(
+                    merged_ds, batch_size, shuffle=shuffle,
+                )
+            return DataLoader(merged_ds, batch_sampler=batch_sampler, collate_fn=collate_fn)
+
+        # Default: standard shuffled / distributed loader
         if distribute_data and dist.is_initialized():
             sampler = DistributedSampler(
                 merged_ds, num_replicas=self.world_size, rank=self.rank, shuffle=shuffle
             )
             return DataLoader(
-                merged_ds,
-                sampler=sampler,
-                batch_size=batch_size,
-                collate_fn=lambda batch: extend_time_series_to_match_patch_size_and_aggregate(
-                    batch, patch_size=patch_size
-                ),
+                merged_ds, sampler=sampler, batch_size=batch_size, collate_fn=collate_fn,
             )
         else:
             return DataLoader(
-                merged_ds,
-                shuffle=shuffle,
-                batch_size=batch_size,
-                collate_fn=lambda batch: extend_time_series_to_match_patch_size_and_aggregate(
-                    batch, patch_size=patch_size
-                ),
+                merged_ds, shuffle=shuffle, batch_size=batch_size, collate_fn=collate_fn,
             )
 
     def _balance_datasets(
@@ -642,7 +776,9 @@ class MergedTrainer:
     def _extract_cot_label(self, text: str) -> str:
         """
         Extract the label after "Answer:" from CoT response.
-        Following the original evaluate_har.py and evaluate_sleep_cot.py logic.
+        Following the original evaluate_har.py and evaluate_ecg_qa.py logic:
+        take everything after the LAST "Answer:" occurrence, strip special
+        tokens and trailing punctuation.
         """
         if text is None:
             return ""
@@ -652,6 +788,8 @@ class MergedTrainer:
         text = re.sub(r'<\|.*?\|>|<eos>$', '', text).strip()
 
         # Find the last occurrence of 'Answer:' (case-insensitive)
+        # This matches evaluate_har.py (last re.finditer) and
+        # evaluate_ecg_qa.py (text.split("Answer: ")[-1]).
         matches = list(re.finditer(r'answer:\s*', text, re.IGNORECASE))
         if matches:
             start = matches[-1].end()
@@ -665,7 +803,7 @@ class MergedTrainer:
             else:
                 label = words[-1] if words else ""
 
-        # Remove trailing punctuation
+        # Remove trailing punctuation (matching evaluate_har.py / evaluate_ecg_qa.py)
         label = re.sub(r'[\.,;:!?]+$', '', label)
         return label.lower().strip()
 
@@ -675,8 +813,79 @@ class MergedTrainer:
         pred_label = self._extract_cot_label(prediction)
         return int(gold_label == pred_label)
 
+    def _calculate_ecg_template_metrics(self, ecg_results: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Compute per-template accuracy and macro-F1 for ECG-QA CoT samples.
+        Mirrors the logic in evaluation/baseline/evaluate_ecg_qa.py.
+        """
+        from collections import defaultdict
+
+        template_groups: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+        for r in ecg_results:
+            tid = r.get("template_id") or r.get("cot_template_id")
+            if tid is None:
+                continue
+            gold_label = self._extract_cot_label(r.get("gold", ""))
+            pred_label = self._extract_cot_label(r.get("generated", ""))
+            possible = r.get("possible_answers", [])
+            possible_lower = [a.lower().strip() for a in possible]
+            template_groups[int(tid)].append({
+                "gold": gold_label,
+                "pred": pred_label,
+                "pred_supported": pred_label in possible_lower,
+                "possible_answers": possible_lower,
+            })
+
+        per_template: Dict[int, Dict[str, Any]] = {}
+        template_macro_f1s = []
+
+        for tid, points in sorted(template_groups.items()):
+            possible_answers = points[0]["possible_answers"]
+            class_counts = {a: {"tp": 0, "fp": 0, "fn": 0} for a in possible_answers}
+
+            correct = 0
+            for p in points:
+                if p["gold"] == p["pred"]:
+                    correct += 1
+                    if p["gold"] in class_counts:
+                        class_counts[p["gold"]]["tp"] += 1
+                else:
+                    if p["gold"] in class_counts:
+                        class_counts[p["gold"]]["fn"] += 1
+                    if p["pred_supported"] and p["pred"] in class_counts:
+                        class_counts[p["pred"]]["fp"] += 1
+
+            class_f1_sum = 0.0
+            valid_classes = 0
+            for counts in class_counts.values():
+                tp, fp, fn = counts["tp"], counts["fp"], counts["fn"]
+                prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+                rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+                f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
+                class_f1_sum += f1
+                valid_classes += 1
+
+            macro_f1 = class_f1_sum / valid_classes if valid_classes > 0 else 0.0
+            template_macro_f1s.append(macro_f1)
+            per_template[tid] = {
+                "num_samples": len(points),
+                "accuracy": correct / len(points) if points else 0.0,
+                "macro_f1": macro_f1,
+            }
+
+        overall_macro_f1 = (
+            sum(template_macro_f1s) / len(template_macro_f1s)
+            if template_macro_f1s else 0.0
+        )
+
+        return {
+            "ecg_overall_macro_f1": overall_macro_f1,
+            "ecg_num_templates": len(per_template),
+            "ecg_per_template": per_template,
+        }
+
     def _calculate_merged_accuracy(
-        self, predictions: List[str], gold_answers: List[str]
+        self, results: List[Dict[str, Any]]
     ) -> Dict[str, Any]:
         """
         Calculate accuracy for merged test set.
@@ -685,20 +894,28 @@ class MergedTrainer:
         - MCQ samples: First 3 chars comparison (original TSQA baseline)
         - CoT samples: Extract label after "Answer:" and compare
         - Captioning samples: Counted but no accuracy metric
+        - ECG CoT samples: Additional per-template F1 metrics
         """
         mcq_correct = 0
         mcq_total = 0
         cot_correct = 0
         cot_total = 0
         captioning_total = 0
+        ecg_results = []
 
-        for pred, gold in zip(predictions, gold_answers):
+        for r in results:
+            pred = r.get("generated", "")
+            gold = r.get("gold", "")
+
             if self._is_mcq_gold(gold):
                 mcq_total += 1
                 mcq_correct += self._calculate_accuracy_baseline(gold, pred)
             elif self._is_cot_gold(gold):
                 cot_total += 1
                 cot_correct += self._calculate_cot_accuracy(gold, pred)
+                # Collect ECG results for per-template analysis
+                if r.get("template_id") is not None or r.get("cot_template_id") is not None:
+                    ecg_results.append(r)
             else:
                 captioning_total += 1
 
@@ -709,7 +926,7 @@ class MergedTrainer:
         total_correct = mcq_correct + cot_correct
         overall_accuracy = total_correct / total_eval if total_eval > 0 else 0.0
 
-        return {
+        metrics = {
             "mcq_accuracy": mcq_accuracy,
             "mcq_correct": mcq_correct,
             "mcq_total": mcq_total,
@@ -719,6 +936,13 @@ class MergedTrainer:
             "overall_accuracy": overall_accuracy,
             "captioning_total": captioning_total,
         }
+
+        # Add ECG per-template metrics when template metadata is available
+        if ecg_results:
+            ecg_metrics = self._calculate_ecg_template_metrics(ecg_results)
+            metrics.update(ecg_metrics)
+
+        return metrics
 
     def _evaluate(
         self,
@@ -758,6 +982,11 @@ class MergedTrainer:
                             "generated": pred,
                             "gold": sample["answer"],
                         }
+                        # Preserve dataset-specific metadata needed for
+                        # per-task evaluation (e.g. ECG per-template F1).
+                        for meta_key in ("template_id", "cot_template_id", "possible_answers"):
+                            if meta_key in sample:
+                                result[meta_key] = sample[meta_key]
                         results.append(result)
                         results_fp.write(json.dumps(result, ensure_ascii=False) + "\n")
                         results_fp.flush()
@@ -788,17 +1017,14 @@ class MergedTrainer:
             metrics["epoch"] = epoch
 
         if metric_func and ((not dist.is_initialized()) or (self.rank == 0)):
-            predictions = []
-            gold_answers = []
+            result_objects = []
             with open(final_results_file, "r", encoding="utf-8") as f:
                 for line in f:
                     try:
-                        obj = json.loads(line)
-                        predictions.append(obj.get("generated", ""))
-                        gold_answers.append(obj.get("gold", ""))
+                        result_objects.append(json.loads(line))
                     except Exception:
                         continue
-            additional_metrics = metric_func(predictions, gold_answers)
+            additional_metrics = metric_func(result_objects)
             metrics.update(additional_metrics)
 
         # Save metrics
@@ -952,12 +1178,16 @@ class MergedTrainer:
                 print(f"    Train: {len(train_ds)}, Val: {len(val_ds)}, Test: {len(test_ds)}")
 
         # Create data loaders
+        # group_by_dataset=True ensures each training batch contains samples
+        # from a single dataset, preventing cross-dataset channel zero-padding
+        # that would corrupt encoder features.
         train_loader = self._merge_data_loaders(
             train_datasets,
             shuffle=True,
             batch_size=batch_size,
             patch_size=PATCH_SIZE,
             distribute_data=self.world_size > 1,
+            group_by_dataset=True,
         )
 
         val_loader = self._merge_data_loaders(
@@ -1044,7 +1274,9 @@ class MergedTrainer:
                 print()
 
             for epoch in range(start_epoch, num_epochs + 1):
-                if hasattr(train_loader.sampler, "set_epoch"):
+                if hasattr(getattr(train_loader, "batch_sampler", None), "set_epoch"):
+                    train_loader.batch_sampler.set_epoch(epoch)
+                elif hasattr(train_loader.sampler, "set_epoch"):
                     train_loader.sampler.set_epoch(epoch)
 
                 # Training
@@ -1181,7 +1413,9 @@ class MergedTrainer:
         tsexam_metrics = self._evaluate(
             tsexam_loader,
             "timeseriesexam1",
-            metric_func=lambda preds, golds: {"accuracy": self._calculate_accuracy(preds, golds)},
+            metric_func=lambda results: {"accuracy": self._calculate_accuracy(
+                [r["generated"] for r in results], [r["gold"] for r in results]
+            )},
             epoch=best_epoch,
         )
 
@@ -1213,6 +1447,9 @@ class MergedTrainer:
                       f"({merged_metrics['cot_correct']}/{merged_metrics['cot_total']} CoT samples)")
             if "overall_accuracy" in merged_metrics:
                 print(f"Merged Test Overall Accuracy: {merged_metrics['overall_accuracy']:.4f}")
+            if "ecg_overall_macro_f1" in merged_metrics:
+                print(f"ECG-QA Macro-F1: {merged_metrics['ecg_overall_macro_f1']:.4f} "
+                      f"({merged_metrics.get('ecg_num_templates', '?')} templates)")
             if "accuracy" in tsexam_metrics:
                 print(f"TimeSeriesExam1 Accuracy: {tsexam_metrics['accuracy']:.4f}")
 
@@ -1326,12 +1563,16 @@ class MergedTrainer:
             print(f"\nTest datasets remain unbalanced for fair evaluation.")
 
         # Create data loaders
+        # group_by_dataset=True ensures each training batch contains samples
+        # from a single dataset, preventing cross-dataset channel zero-padding
+        # that would corrupt encoder features.
         train_loader = self._merge_data_loaders(
             balanced_train,
             shuffle=True,
             batch_size=batch_size,
             patch_size=PATCH_SIZE,
             distribute_data=self.world_size > 1,
+            group_by_dataset=True,
         )
 
         val_loader = self._merge_data_loaders(
@@ -1413,7 +1654,9 @@ class MergedTrainer:
 
             # Training loop
             for epoch in range(start_epoch, num_epochs + 1):
-                if hasattr(train_loader.sampler, "set_epoch"):
+                if hasattr(getattr(train_loader, "batch_sampler", None), "set_epoch"):
+                    train_loader.batch_sampler.set_epoch(epoch)
+                elif hasattr(train_loader.sampler, "set_epoch"):
                     train_loader.sampler.set_epoch(epoch)
 
                 # Training
@@ -1550,7 +1793,9 @@ class MergedTrainer:
         tsexam_metrics = self._evaluate(
             tsexam_loader,
             "timeseriesexam1",
-            metric_func=lambda preds, golds: {"accuracy": self._calculate_accuracy(preds, golds)},
+            metric_func=lambda results: {"accuracy": self._calculate_accuracy(
+                [r["generated"] for r in results], [r["gold"] for r in results]
+            )},
             epoch=best_epoch,
         )
 
@@ -1584,6 +1829,9 @@ class MergedTrainer:
                       f"({merged_metrics['cot_correct']}/{merged_metrics['cot_total']} CoT samples)")
             if "overall_accuracy" in merged_metrics:
                 print(f"Merged Test Overall Accuracy: {merged_metrics['overall_accuracy']:.4f}")
+            if "ecg_overall_macro_f1" in merged_metrics:
+                print(f"ECG-QA Macro-F1: {merged_metrics['ecg_overall_macro_f1']:.4f} "
+                      f"({merged_metrics.get('ecg_num_templates', '?')} templates)")
             if "accuracy" in tsexam_metrics:
                 print(f"TimeSeriesExam1 Accuracy: {tsexam_metrics['accuracy']:.4f}")
 

@@ -66,6 +66,7 @@ class OpenTSLMFlamingo(TimeSeriesLLM):
             cache_dir=None,
             device_map={"": device},
             attn_implementation="eager",
+            dtype=torch.float32,
         )
 
         # add Flamingo special tokens to the tokenizer
