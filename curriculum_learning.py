@@ -22,6 +22,7 @@ from time_series_datasets.timeseriesexam.TimeSeriesExam1QADataset import TimeSer
 from time_series_datasets.sleep.SleepEDFCoTQADataset import SleepEDFCoTQADataset
 from time_series_datasets.har_cot.HARCoTQADataset import HARCoTQADataset
 from time_series_datasets.ecg_qa.ECGQACoTQADataset import ECGQACoTQADataset
+from time_series_datasets.financial_reports.FinancialReportsQADataset import FinancialReportsQADataset
 from time_series_datasets.util import (
     extend_time_series_to_match_patch_size_and_aggregate,
 )
@@ -72,6 +73,7 @@ CURRICULUM_STAGES = [
     "stage3_cot",
     "stage4_sleep_cot",
     "stage5_ecg_cot",
+    "stage6_financial_reports",
 ]
 
 
@@ -1488,6 +1490,34 @@ class CurriculumTrainer:
             sampler=sampler,
         )
 
+    def stage6_financial_reports(
+        self, batch_size: int = None, eval_only: bool = False
+    ) -> Dict[str, Any]:
+        """Stage 6: Financial Reports Post-Filing Return Prediction.
+
+        Task: Given a regulatory filing text and 60-day stock price history,
+        predict whether the stock increases or decreases over the next 5 trading days.
+
+        Configuration:
+        - Epochs: 30
+        - OpenTSLMSP: encoder_lr=2e-4, projector_lr=1e-4
+        - OpenTSLMFlamingo: base_lr=2e-4
+        - Metric: Accuracy (binary MCQ: increase vs decrease)
+        """
+        return self._train_stage(
+            stage_name="stage6_financial_reports",
+            dataset_class=FinancialReportsQADataset,
+            num_epochs=30,
+            lr_encoder=2e-4,
+            lr_projector=1e-4,
+            lr_base=2e-4,
+            metric_func=lambda preds, golds: {
+                "accuracy": self._calculate_accuracy(preds, golds)
+            },
+            batch_size=batch_size,
+            eval_only=eval_only,
+        )
+
     def run_curriculum(
         self, stages: List[str] = None, batch_size: int = None, eval_only: bool = False
     ):
@@ -1569,6 +1599,12 @@ class CurriculumTrainer:
                 self._mark_stage_completed(stage, stage_results)
             elif stage == "stage5_ecg_cot":
                 stage_results = self.stage5_ecg_cot(
+                    batch_size=batch_size, eval_only=eval_only
+                )
+                results[stage] = stage_results
+                self._mark_stage_completed(stage, stage_results)
+            elif stage == "stage6_financial_reports":
+                stage_results = self.stage6_financial_reports(
                     batch_size=batch_size, eval_only=eval_only
                 )
                 results[stage] = stage_results
