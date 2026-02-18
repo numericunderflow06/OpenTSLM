@@ -2,8 +2,10 @@
 # Financial Reports + Stock Price QA Dataset for OpenTSLM
 #
 # Task: Given a regulatory filing text and the stock's recent price history,
-# predict whether the stock price will increase or decrease over the next
-# 5 trading days after the filing date.
+# answer one of three question types:
+#   1. Price return — will the stock price increase or decrease?
+#   2. Volatility — will volatility increase, decrease, or remain stable?
+#   3. Market direction — will the stock trend bullish, bearish, or sideways?
 #
 
 from datasets import Dataset
@@ -20,6 +22,13 @@ from time_series_datasets.financial_reports.financial_reports_loader import (
 import torch
 import numpy as np
 
+QUESTION_TYPES = ("price_return", "volatility", "direction")
+LABEL_KEYS = {
+    "price_return": "label",
+    "volatility": "volatility_label",
+    "direction": "direction_label",
+}
+
 
 class FinancialReportsQADataset(QADataset):
     def __init__(
@@ -32,10 +41,22 @@ class FinancialReportsQADataset(QADataset):
         super().__init__(split, EOS_TOKEN, format_sample_str, time_series_format_function)
 
     def _load_splits(self) -> Tuple[Dataset, Dataset, Dataset]:
-        return load_financial_reports_splits()
+        train, val, test = load_financial_reports_splits()
+        return self._expand(train), self._expand(val), self._expand(test)
+
+    @staticmethod
+    def _expand(dataset: Dataset) -> Dataset:
+        """Expand each row into 3 rows, one per question type."""
+        rows = []
+        for row in dataset:
+            for qt in QUESTION_TYPES:
+                new_row = dict(row)
+                new_row["question_type"] = qt
+                rows.append(new_row)
+        return Dataset.from_list(rows)
 
     def _get_answer(self, row) -> str:
-        return row["label"]
+        return row[LABEL_KEYS[row["question_type"]]]
 
     def _get_pre_prompt(self, row) -> str:
         filing_type = row["filing_type_specific"]
@@ -52,13 +73,36 @@ class FinancialReportsQADataset(QADataset):
         )
 
     def _get_post_prompt(self, row) -> str:
-        return (
-            "Based on the stock price trend leading up to this filing and the filing content, "
-            "will the stock price increase or decrease over the next 5 trading days?\n"
-            "(a) Increase\n"
-            "(b) Decrease\n"
-            "Answer:"
-        )
+        qt = row["question_type"]
+        opening = "Based on the stock price trend leading up to this filing and the filing content, "
+
+        if qt == "price_return":
+            return (
+                opening
+                + "will the stock price increase or decrease over the next 5 trading days?\n"
+                "(a) Increase\n"
+                "(b) Decrease\n"
+                "Answer:"
+            )
+        elif qt == "volatility":
+            return (
+                opening
+                + "will the stock's daily price volatility increase, decrease, or remain stable "
+                "over the next 5 trading days compared to the 60 days before the filing?\n"
+                "(a) Increase\n"
+                "(b) Decrease\n"
+                "(c) Remain stable\n"
+                "Answer:"
+            )
+        else:  # direction
+            return (
+                opening
+                + "what will be the overall market direction of this stock over the next 5 trading days?\n"
+                "(a) Bullish (upward trend)\n"
+                "(b) Bearish (downward trend)\n"
+                "(c) Sideways (no clear trend)\n"
+                "Answer:"
+            )
 
     def _get_text_time_series_prompt_list(self, row) -> List[TextTimeSeriesPrompt]:
         prices = row["pre_prices"]
@@ -83,14 +127,15 @@ class FinancialReportsQADataset(QADataset):
 
     @staticmethod
     def get_labels() -> List[str]:
-        return ["(a)", "(b)"]
+        return ["(a)", "(b)", "(c)"]
 
     def _format_sample(self, row):
         sample = super()._format_sample(row)
-        sample["label"] = row["label"]
+        sample["label"] = row[LABEL_KEYS[row["question_type"]]]
         sample["company_name"] = row["company_name"]
         sample["filing_date"] = row["filing_date"]
         sample["post_return"] = row["post_return"]
+        sample["question_type"] = row["question_type"]
         return sample
 
 
@@ -106,14 +151,16 @@ if __name__ == "__main__":
     )
 
     if len(dataset) > 0:
-        sample = dataset[0]
-        print(f"\nSample keys: {list(sample.keys())}")
-        print(f"Company: {sample['company_name']}")
-        print(f"Filing date: {sample['filing_date']}")
-        print(f"Label: {sample['label']}")
-        print(f"Post return: {sample['post_return']:.4f}")
-        print(f"\nPre-prompt preview:\n{sample['pre_prompt'][:300]}...")
-        print(f"\nTime series text: {sample['time_series_text']}")
-        print(f"Time series shape: {[len(ts) for ts in sample['time_series']]}")
-        print(f"\nPost-prompt:\n{sample['post_prompt']}")
-        print(f"\nAnswer: {sample['answer']}")
+        # Show one sample per question type
+        for qt in QUESTION_TYPES:
+            for i in range(len(dataset)):
+                sample = dataset[i]
+                if sample["question_type"] == qt:
+                    print(f"\n--- Question type: {qt} ---")
+                    print(f"Company: {sample['company_name']}")
+                    print(f"Filing date: {sample['filing_date']}")
+                    print(f"Label: {sample['label']}")
+                    print(f"Post return: {sample['post_return']:.4f}")
+                    print(f"\nPost-prompt:\n{sample['post_prompt']}")
+                    print(f"\nAnswer: {sample['answer']}")
+                    break

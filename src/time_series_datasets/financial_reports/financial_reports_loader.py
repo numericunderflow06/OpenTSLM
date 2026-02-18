@@ -10,6 +10,7 @@ import os
 import sys
 import json
 import pickle
+import re
 import csv
 from typing import Tuple, Dict, List, Optional
 from datetime import datetime, timedelta
@@ -119,13 +120,14 @@ def _get_price_window(
     filing_date: datetime,
     pre_days: int,
     post_days: int,
-) -> Optional[Tuple[np.ndarray, float]]:
+) -> Optional[Tuple[np.ndarray, float, np.ndarray]]:
     """
-    Extract pre-filing price series and post-filing return.
+    Extract pre-filing price series, post-filing return, and post-filing prices.
 
     Returns:
-        Tuple of (pre_prices_array, post_return) or None if insufficient data.
-        post_return is the fractional return over post_days trading days.
+        Tuple of (pre_prices_array, post_return, post_prices_array) or None if
+        insufficient data. post_return is the fractional return over post_days
+        trading days. post_prices is the array of post-filing closing prices.
     """
     filing_ts = pd.Timestamp(filing_date)
 
@@ -153,15 +155,113 @@ def _get_price_window(
     close_after = post_data.iloc[post_days - 1]["Close"]
     post_return = (close_after - close_at_filing) / close_at_filing
 
-    return pre_prices, float(post_return)
+    post_prices = post_data.iloc[:post_days]["Close"].values.astype(np.float64)
+    return pre_prices, float(post_return), post_prices
+
+
+def _compute_volatility_label(pre_prices: np.ndarray, post_prices: np.ndarray) -> str:
+    """
+    Compare post-filing volatility to pre-filing volatility.
+
+    Returns:
+        "(a)" if volatility increased (ratio > 1.5),
+        "(b)" if decreased (ratio < 0.667),
+        "(c)" if stable.
+    """
+    pre_returns = np.diff(pre_prices) / pre_prices[:-1]
+    # Anchor post returns to the last pre-filing price for continuity
+    full_post = np.concatenate([[pre_prices[-1]], post_prices])
+    post_returns = np.diff(full_post) / full_post[:-1]
+
+    pre_vol = np.std(pre_returns)
+    post_vol = np.std(post_returns)
+
+    if pre_vol < 1e-10:
+        # Pre-filing volatility near zero — any post movement counts as increase
+        return "(a)" if post_vol > 1e-10 else "(c)"
+
+    ratio = post_vol / pre_vol
+    if ratio > 1.5:
+        return "(a)"   # increase
+    elif ratio < 0.667:
+        return "(b)"   # decrease
+    else:
+        return "(c)"   # stable
+
+
+def _compute_direction_label(post_prices: np.ndarray) -> str:
+    """
+    Determine the overall market direction over post-filing days via linear regression slope.
+
+    Returns:
+        "(a)" if bullish (norm_slope > 0.002),
+        "(b)" if bearish (norm_slope < -0.002),
+        "(c)" if sideways.
+    """
+    slope = np.polyfit(np.arange(len(post_prices)), post_prices, 1)[0]
+    mean_price = np.mean(post_prices)
+    if mean_price < 1e-10:
+        return "(c)"
+    norm_slope = slope / mean_price  # fraction per day
+
+    if norm_slope > 0.002:
+        return "(a)"   # bullish
+    elif norm_slope < -0.002:
+        return "(b)"   # bearish
+    else:
+        return "(c)"   # sideways
+
+
+def _strip_boilerplate(text: str) -> str:
+    """Remove boilerplate lines from filing text, preserving financial content."""
+    lines = text.split("\n")
+    cleaned = []
+    for line in lines:
+        stripped = line.strip()
+        # Empty heading markers (e.g. "# " with only whitespace after #)
+        if re.match(r"^#+\s*$", stripped):
+            continue
+        # "News Details" header
+        if stripped == "News Details":
+            continue
+        # Type + date metadata (e.g. "Ad-hoc | 29 March 2001 17:23")
+        if re.match(r"^.+\|\s*\d{1,2}\s+\w+\s+\d{4}\s+\d{1,2}:\d{2}", stripped):
+            continue
+        # Image placeholders (e.g. "![](_page_1_Picture_0.jpeg)")
+        if re.match(r"^!\[.*\]\(.*\.(jpe?g|png|gif|svg|bmp)", stripped, re.IGNORECASE):
+            continue
+        # Long separator lines (5+ dashes, equals, or unicode dashes)
+        if re.match(r"^[\-=\u2014\u2013\u2015]{5,}\s*$", stripped):
+            continue
+        # DGAP/legal disclaimers
+        if "DGAP" in stripped or "issuer is solely responsible" in stripped or "verarbeitet und übermittelt durch" in stripped:
+            continue
+        # Contact info lines
+        if re.match(r"^(Contact:|Tel\.|Fax|E-Mail:)", stripped):
+            continue
+        # WKN/ISIN metadata lines
+        if re.match(r"^(WKN|ISIN|Index|Notiert|Listed)\b", stripped):
+            continue
+        # End-of-announcement markers
+        if re.match(r"^(End of|Ende der)\b", stripped):
+            continue
+        # Archive references
+        if re.match(r"^Archive at\b", stripped):
+            continue
+        cleaned.append(line)
+    return "\n".join(cleaned)
 
 
 def _read_filing_text(relative_path: str) -> str:
-    """Read the markdown filing text, truncated to MAX_FILING_TEXT_CHARS."""
+    """Read the markdown filing text, strip boilerplate, truncate to MAX_FILING_TEXT_CHARS."""
     full_path = os.path.join(REPORTS_BASE, relative_path)
     try:
         with open(full_path, "r", encoding="utf-8", errors="replace") as f:
-            text = f.read(MAX_FILING_TEXT_CHARS + 500)
+            text = f.read()
+        # Strip boilerplate lines
+        text = _strip_boilerplate(text)
+        # Collapse runs of 3+ blank lines to 2
+        text = re.sub(r"\n{3,}", "\n\n", text)
         # Truncate cleanly at a sentence/paragraph boundary
         if len(text) > MAX_FILING_TEXT_CHARS:
             # Try to cut at last paragraph break
@@ -229,7 +329,7 @@ def build_preprocessed_dataset(force: bool = False) -> pd.DataFrame:
             skipped_no_window += 1
             continue
 
-        pre_prices, post_return = result
+        pre_prices, post_return, post_prices = result
 
         filing_text = _read_filing_text(row["relative_path"])
         if not filing_text:
@@ -237,6 +337,8 @@ def build_preprocessed_dataset(force: bool = False) -> pd.DataFrame:
             continue
 
         label = "(a)" if post_return >= 0 else "(b)"
+        volatility_label = _compute_volatility_label(pre_prices, post_prices)
+        direction_label = _compute_direction_label(post_prices)
 
         samples.append({
             "company_name": row["company_name"],
@@ -250,6 +352,9 @@ def build_preprocessed_dataset(force: bool = False) -> pd.DataFrame:
             "pre_prices": pre_prices.tolist(),
             "post_return": post_return,
             "label": label,
+            "volatility_label": volatility_label,
+            "direction_label": direction_label,
+            "post_prices": post_prices.tolist(),
             "filing_text": filing_text,
             "relative_path": row["relative_path"],
         })
@@ -263,7 +368,9 @@ def build_preprocessed_dataset(force: bool = False) -> pd.DataFrame:
     print(f"Skipped (no text):          {skipped_no_text}")
     print(f"Final dataset size:         {len(df)}")
     if len(df) > 0:
-        print(f"Label distribution:         (a) increase: {(df['label'] == '(a)').sum()}, (b) decrease: {(df['label'] == '(b)').sum()}")
+        print(f"Price return labels:        (a) increase: {(df['label'] == '(a)').sum()}, (b) decrease: {(df['label'] == '(b)').sum()}")
+        print(f"Volatility labels:          (a) increase: {(df['volatility_label'] == '(a)').sum()}, (b) decrease: {(df['volatility_label'] == '(b)').sum()}, (c) stable: {(df['volatility_label'] == '(c)').sum()}")
+        print(f"Direction labels:           (a) bullish: {(df['direction_label'] == '(a)').sum()}, (b) bearish: {(df['direction_label'] == '(b)').sum()}, (c) sideways: {(df['direction_label'] == '(c)').sum()}")
         print(f"Companies represented:      {df['isin'].nunique()}")
         print(f"Date range:                 {df['filing_date'].min()} to {df['filing_date'].max()}")
         print(f"Filing types:               {df['filing_type_specific'].nunique()} unique types")

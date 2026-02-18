@@ -367,6 +367,7 @@ class MergedTrainer:
         dist_backend: str = "nccl",
         local_rank: int = int(os.environ.get("LOCAL_RANK", 0)),
         llm_id: str = None,
+        session: str = None,
     ):
         """
         Initialize the merged trainer.
@@ -379,6 +380,7 @@ class MergedTrainer:
             dist_backend: Distributed backend
             local_rank: Local GPU rank
             llm_id: LLM model ID
+            session: Session name for results directory. Auto-generated from timestamp if None.
         """
         self.model_type = model_type
         self.device = device or self._get_device()
@@ -386,6 +388,11 @@ class MergedTrainer:
             print("Warning: Using MPS, might not be fully compatible. Use CUDA for best results.")
         self.llm_id = llm_id
         self.llm_id_safe = self._sanitize_llm_id(llm_id)
+
+        # Session folder for isolating runs
+        if session is None:
+            session = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.session = session
 
         # Distributed training parameters
         self.gradient_checkpointing = gradient_checkpointing
@@ -400,8 +407,11 @@ class MergedTrainer:
             self._init_distributed()
 
         self.model = self._initialize_model()
-        self.results_dir = os.path.join("results_merged", self.llm_id_safe, self.model_type)
+        self.results_dir = os.path.join("results_merged", self.llm_id_safe, self.model_type, self.session)
         self._create_results_dir()
+        if self.rank == 0:
+            print(f"Session: {self.session}")
+            print(f"Results directory: {self.results_dir}")
 
     def _get_device(self) -> str:
         """Get the best available device."""
@@ -1916,6 +1926,12 @@ def main():
         default="max",
         help="Balance strategy: 'max' to match largest dataset size, or an integer target size"
     )
+    parser.add_argument(
+        "--session",
+        type=str,
+        default=None,
+        help="Session name for results directory. Auto-generated from timestamp if not provided."
+    )
 
     args = parser.parse_args()
 
@@ -1930,6 +1946,7 @@ def main():
         dist_backend=args.dist_backend,
         local_rank=args.local_rank,
         llm_id=args.llm_id,
+        session=args.session,
     )
 
     if args.balanced:

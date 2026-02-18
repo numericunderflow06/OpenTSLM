@@ -23,6 +23,10 @@ from time_series_datasets.sleep.SleepEDFCoTQADataset import SleepEDFCoTQADataset
 from time_series_datasets.har_cot.HARCoTQADataset import HARCoTQADataset
 from time_series_datasets.ecg_qa.ECGQACoTQADataset import ECGQACoTQADataset
 from time_series_datasets.financial_reports.FinancialReportsQADataset import FinancialReportsQADataset
+from time_series_datasets.zuco_eeg.ZuCoEEGReadingTaskDataset import ZuCoEEGReadingTaskDataset
+from time_series_datasets.zuco_eeg.ZuCoEEGSentimentDataset import ZuCoEEGSentimentDataset
+from time_series_datasets.zuco_eyetracking.ZuCoETReadingTaskDataset import ZuCoETReadingTaskDataset
+from time_series_datasets.zuco_eyetracking.ZuCo2ETReadingTaskDataset import ZuCo2ETReadingTaskDataset
 from time_series_datasets.util import (
     extend_time_series_to_match_patch_size_and_aggregate,
 )
@@ -74,6 +78,10 @@ CURRICULUM_STAGES = [
     "stage4_sleep_cot",
     "stage5_ecg_cot",
     "stage6_financial_reports",
+    "stage7_eeg_reading_task",
+    "stage8_eeg_sentiment",
+    "stage9_et_reading_task",
+    "stage9b_et2_reading_task",
 ]
 
 
@@ -120,6 +128,8 @@ class CurriculumTrainer:
         dist_backend: str = "nccl",
         local_rank: int = int(os.environ.get("LOCAL_RANK", 0)),
         llm_id: str = None,
+        init_checkpoint: str = None,
+        experiment_tag: str = None,
     ):
         """
         Initialize the curriculum trainer.
@@ -132,6 +142,8 @@ class CurriculumTrainer:
             dist_backend: Distributed backend
             local_rank: Local GPU rank
             llm_id: LLM model ID (e.g., 'google/medgemma-2b', 'meta-llama/Llama-3.2-1B')
+            init_checkpoint: Path to an external .pt checkpoint file; bypasses previous-stage loading
+            experiment_tag: Tag appended to results dir: results/{llm_id}/{model_type}_{tag}/
         """
         self.model_type = model_type
         self.device = device or self._get_device()
@@ -141,6 +153,8 @@ class CurriculumTrainer:
             )
         self.llm_id = llm_id
         self.llm_id_safe = self._sanitize_llm_id(llm_id)
+        self.init_checkpoint = init_checkpoint
+        self.experiment_tag = experiment_tag
 
         # Distributed training parameters
         self.gradient_checkpointing = gradient_checkpointing
@@ -155,7 +169,11 @@ class CurriculumTrainer:
             self._init_distributed()
 
         self.model = self._initialize_model()
-        self.results_dir = os.path.join("results", self.llm_id_safe, self.model_type)
+        # Build results dir with optional experiment tag
+        model_dir_name = self.model_type
+        if self.experiment_tag:
+            model_dir_name = f"{self.model_type}_{self.experiment_tag}"
+        self.results_dir = os.path.join("results", self.llm_id_safe, model_dir_name)
         self._create_results_dir()
 
     def _get_device(self) -> str:
@@ -519,10 +537,24 @@ class CurriculumTrainer:
                     # Add 'module.' prefix for DDP
                     model_state = {f"module.{k}": v for k, v in model_state.items()}
 
+                # Filter out keys with shape mismatches
+                current_state = self.model.state_dict()
+                skipped_keys = []
+                filtered_state = {}
+                for k, v in model_state.items():
+                    if k in current_state and v.shape != current_state[k].shape:
+                        skipped_keys.append((k, v.shape, current_state[k].shape))
+                    else:
+                        filtered_state[k] = v
+                if skipped_keys and self.rank == 0:
+                    print(f"⚠️  Skipping {len(skipped_keys)} keys with shape mismatch:")
+                    for k, ckpt_shape, model_shape in skipped_keys[:5]:
+                        print(f"   - {k}: checkpoint {ckpt_shape} vs model {model_shape}")
+
                 # Load state dict with strict=False to handle missing keys
                 try:
                     missing_keys, unexpected_keys = self.model.load_state_dict(
-                        model_state, strict=False
+                        filtered_state, strict=False
                     )
                     if missing_keys and self.rank == 0:
                         print(
@@ -571,7 +603,53 @@ class CurriculumTrainer:
     def _load_previous_stage_model(
         self, current_stage: str
     ) -> Optional[Dict[str, Any]]:
-        """Load the best model from the previous stage and return its metrics."""
+        """Load the best model from the previous stage and return its metrics.
+        If self.init_checkpoint is set, loads from that external checkpoint instead."""
+        # --- External init_checkpoint override ---
+        if self.init_checkpoint:
+            if not os.path.exists(self.init_checkpoint):
+                raise RuntimeError(
+                    f"init_checkpoint not found: {self.init_checkpoint}"
+                )
+            if self.rank == 0:
+                print(f"📂 Loading external init checkpoint: {self.init_checkpoint}")
+                print("   This might take a while...")
+            checkpoint = torch.load(
+                self.init_checkpoint, map_location="cpu", weights_only=False
+            )
+            model = self._get_model()
+            if self.model_type == "OpenTSLMSP":
+                model.encoder.load_state_dict(checkpoint["encoder_state"])
+                model.projector.load_state_dict(checkpoint["projector_state"])
+                try:
+                    model.load_lora_state_from_checkpoint(
+                        checkpoint, allow_missing=True
+                    )
+                except RuntimeError as e:
+                    if self.rank == 0:
+                        print(f"⚠️  LoRA state not loaded from init checkpoint: {e}")
+            else:
+                model_state = checkpoint["model_state"]
+                if hasattr(self.model, "module"):
+                    model_state = {f"module.{k}": v for k, v in model_state.items()}
+                current_state = self.model.state_dict()
+                filtered_state = {}
+                skipped_keys = []
+                for k, v in model_state.items():
+                    if k in current_state and v.shape != current_state[k].shape:
+                        skipped_keys.append((k, v.shape, current_state[k].shape))
+                    else:
+                        filtered_state[k] = v
+                if skipped_keys and self.rank == 0:
+                    print(f"⚠️  Skipping {len(skipped_keys)} keys with shape mismatch")
+                self.model.load_state_dict(filtered_state, strict=False)
+            return {
+                "stage": "init_checkpoint",
+                "metrics": {},
+                "epoch": checkpoint.get("epoch", "?"),
+                "val_loss": checkpoint.get("val_loss", "?"),
+            }
+
         try:
             current_idx = CURRICULUM_STAGES.index(current_stage)
             if current_idx == 0:
@@ -583,7 +661,7 @@ class CurriculumTrainer:
             )
             if not os.path.exists(metrics_file):
                 # PATCH: If running stage2_captioning and previous stage metrics are missing, skip loading
-                if current_stage == "stage2_captioning":
+                if current_stage in ("stage2_captioning", "stage6_financial_reports", "stage7_eeg_reading_task", "stage8_eeg_sentiment", "stage9_et_reading_task", "stage9b_et2_reading_task"):
                     if self.rank == 0:
                         print(
                             f"⚠️  Skipping previous stage {previous_stage} because metrics file not found: {metrics_file}"
@@ -609,7 +687,7 @@ class CurriculumTrainer:
             )
             if not os.path.exists(checkpoint_path):
                 # PATCH: If running stage2_captioning and previous stage checkpoint is missing, skip loading
-                if current_stage == "stage2_captioning":
+                if current_stage in ("stage2_captioning", "stage6_financial_reports", "stage7_eeg_reading_task", "stage8_eeg_sentiment", "stage9_et_reading_task", "stage9b_et2_reading_task"):
                     if self.rank == 0:
                         print(
                             f"⚠️  Skipping previous stage {previous_stage} because checkpoint not found: {checkpoint_path}"
@@ -656,10 +734,23 @@ class CurriculumTrainer:
                 if hasattr(self.model, "module"):
                     # Add 'module.' prefix for DDP
                     model_state = {f"module.{k}": v for k, v in model_state.items()}
+                # Filter out keys with shape mismatches (e.g. pos_embed from different max_seq_len)
+                current_state = self.model.state_dict()
+                skipped_keys = []
+                filtered_state = {}
+                for k, v in model_state.items():
+                    if k in current_state and v.shape != current_state[k].shape:
+                        skipped_keys.append((k, v.shape, current_state[k].shape))
+                    else:
+                        filtered_state[k] = v
+                if skipped_keys and self.rank == 0:
+                    print(f"⚠️  Skipping {len(skipped_keys)} keys with shape mismatch:")
+                    for k, ckpt_shape, model_shape in skipped_keys[:5]:
+                        print(f"   - {k}: checkpoint {ckpt_shape} vs model {model_shape}")
                 # Load state dict with strict=False to handle missing keys
                 try:
                     missing_keys, unexpected_keys = self.model.load_state_dict(
-                        model_state, strict=False
+                        filtered_state, strict=False
                     )
                     if missing_keys and self.rank == 0:
                         print(
@@ -695,30 +786,35 @@ class CurriculumTrainer:
 
     def _calculate_accuracy_baseline(self, gold: str, prediction: str) -> int:
         """
-        Original OpenTSLM baseline evaluation logic from evaluate_tsqa.py.
+        Evaluation logic supporting both MCQ labels like "(a)" and
+        free-text labels like "Normal Reading" or "negative".
 
-        This uses:
-        - First 3 characters comparison only
-        - Lowercase, case-insensitive matching
-        - Exact match after extracting answer
+        Matching hierarchy:
+        1. Exact match (after cleaning)
+        2. Prediction starts with gold label
+        3. First-3-char match (MCQ backward compat)
         """
-        # Clean up strings for comparison
         gt_clean = gold.replace("<|end_of_text|>", "").lower().strip()
         pred_clean = prediction.lower().strip()
-
-        # Only compare the first 3 characters (e.g., "(a)", "(b)", "(c)")
-        gt_clean = gt_clean[:3]
-        pred_clean = pred_clean[:3]
 
         # Extract the actual answer from the prediction (everything after "Answer:")
         answer_match = re.search(r'answer:\s*(.+)', pred_clean, re.IGNORECASE)
         if answer_match:
-            pred_answer = answer_match.group(1).strip()[:3]
-        else:
-            pred_answer = pred_clean
+            pred_clean = answer_match.group(1).strip()
 
-        # Calculate accuracy (exact match)
-        return int(gt_clean == pred_answer)
+        # 1. Exact match
+        if pred_clean == gt_clean:
+            return 1
+
+        # 2. Prediction starts with the gold label
+        if pred_clean.startswith(gt_clean):
+            return 1
+
+        # 3. MCQ backward compat: first 3 chars (for "(a)", "(b)", etc.)
+        if len(gt_clean) <= 3 and pred_clean[:3] == gt_clean[:3]:
+            return 1
+
+        return 0
 
     def _calculate_accuracy(
         self, predictions: List[str], gold_answers: List[str]
@@ -977,7 +1073,7 @@ class CurriculumTrainer:
                     print()
             else:
                 # Only allow fresh model for first stage
-                if stage_name != CURRICULUM_STAGES[0]:
+                if stage_name not in (CURRICULUM_STAGES[0], "stage6_financial_reports", "stage9_et_reading_task", "stage9b_et2_reading_task"):
                     raise RuntimeError(
                         f"Cannot start {stage_name} with fresh model. Previous stage {CURRICULUM_STAGES[CURRICULUM_STAGES.index(stage_name) - 1]} must be completed first."
                     )
@@ -1438,58 +1534,6 @@ class CurriculumTrainer:
             sampler=sampler,
         )
 
-    def stage4_sleep_cot(
-        self, batch_size: int = None, eval_only: bool = False
-    ) -> Dict[str, Any]:
-        """Stage 4: Chain-of-Thought Reasoning (SleepEDF).
-
-        Configuration:
-        - Epochs: 60
-        - OpenTSLMSP: encoder_lr=2e-4, projector_lr=1e-4
-        - OpenTSLMFlamingo: base_lr=2e-4
-        - Metric: Test loss only (chain-of-thought reasoning)
-        """
-        sampler = None
-
-        return self._train_stage(
-            stage_name="stage4_sleep_cot",
-            dataset_class=SleepEDFCoTQADataset,
-            num_epochs=60,
-            lr_encoder=2e-4,
-            lr_projector=1e-4,
-            lr_base=2e-4,
-            metric_func=None,  # Only test loss for chain-of-thought reasoning
-            batch_size=batch_size,
-            eval_only=eval_only,
-            sampler=sampler,
-        )
-
-    def stage5_ecg_cot(
-        self, batch_size: int = None, eval_only: bool = False
-    ) -> Dict[str, Any]:
-        """Stage 5: Chain-of-Thought Reasoning (ECG QA CoT).
-
-        Configuration:
-        - Epochs: 60
-        - OpenTSLMSP: encoder_lr=2e-4, projector_lr=1e-4
-        - OpenTSLMFlamingo: base_lr=2e-4
-        - Metric: Test loss only (chain-of-thought reasoning)
-        """
-        sampler = None
-
-        return self._train_stage(
-            stage_name="stage5_ecg_cot",
-            dataset_class=ECGQACoTQADataset,
-            num_epochs=60,
-            lr_encoder=2e-4,
-            lr_projector=1e-4,
-            lr_base=2e-4,
-            metric_func=None,  # Only test loss for chain-of-thought reasoning
-            batch_size=batch_size,
-            eval_only=eval_only,
-            sampler=sampler,
-        )
-
     def stage6_financial_reports(
         self, batch_size: int = None, eval_only: bool = False
     ) -> Dict[str, Any]:
@@ -1507,6 +1551,118 @@ class CurriculumTrainer:
         return self._train_stage(
             stage_name="stage6_financial_reports",
             dataset_class=FinancialReportsQADataset,
+            num_epochs=30,
+            lr_encoder=2e-4,
+            lr_projector=1e-4,
+            lr_base=2e-4,
+            metric_func=lambda preds, golds: {
+                "accuracy": self._calculate_accuracy(preds, golds)
+            },
+            batch_size=batch_size,
+            eval_only=eval_only,
+        )
+
+    def stage7_eeg_reading_task(
+        self, batch_size: int = None, eval_only: bool = False
+    ) -> Dict[str, Any]:
+        """Stage 7: ZuCo EEG Reading Task Classification.
+
+        Task: Given multi-channel EEG signals recorded during reading,
+        classify whether the reader was engaged in Normal Reading or Task-Specific Reading.
+
+        Configuration:
+        - Epochs: 30
+        - OpenTSLMSP: encoder_lr=2e-4, projector_lr=1e-4
+        - OpenTSLMFlamingo: base_lr=2e-4
+        - Metric: Accuracy
+        """
+        return self._train_stage(
+            stage_name="stage7_eeg_reading_task",
+            dataset_class=ZuCoEEGReadingTaskDataset,
+            num_epochs=30,
+            lr_encoder=2e-4,
+            lr_projector=1e-4,
+            lr_base=2e-4,
+            metric_func=lambda preds, golds: {
+                "accuracy": self._calculate_accuracy(preds, golds)
+            },
+            batch_size=batch_size,
+            eval_only=eval_only,
+        )
+
+    def stage8_eeg_sentiment(
+        self, batch_size: int = None, eval_only: bool = False
+    ) -> Dict[str, Any]:
+        """Stage 8: ZuCo EEG Sentiment Classification.
+
+        Task: Given multi-channel EEG signals recorded during sentiment reading,
+        classify the sentiment of the text being read (negative, neutral, positive).
+
+        Configuration:
+        - Epochs: 30
+        - OpenTSLMSP: encoder_lr=2e-4, projector_lr=1e-4
+        - OpenTSLMFlamingo: base_lr=2e-4
+        - Metric: Accuracy
+        """
+        return self._train_stage(
+            stage_name="stage8_eeg_sentiment",
+            dataset_class=ZuCoEEGSentimentDataset,
+            num_epochs=30,
+            lr_encoder=2e-4,
+            lr_projector=1e-4,
+            lr_base=2e-4,
+            metric_func=lambda preds, golds: {
+                "accuracy": self._calculate_accuracy(preds, golds)
+            },
+            batch_size=batch_size,
+            eval_only=eval_only,
+        )
+
+    def stage9_et_reading_task(
+        self, batch_size: int = None, eval_only: bool = False
+    ) -> Dict[str, Any]:
+        """Stage 9: ZuCo Eye-Tracking Reading Task Classification.
+
+        Task: Given word-level eye-tracking metrics recorded during reading,
+        classify whether the reader was engaged in Normal Reading or Task-Specific Reading.
+
+        Configuration:
+        - Epochs: 30
+        - OpenTSLMSP: encoder_lr=2e-4, projector_lr=1e-4
+        - OpenTSLMFlamingo: base_lr=2e-4
+        - Metric: Accuracy
+        """
+        return self._train_stage(
+            stage_name="stage9_et_reading_task",
+            dataset_class=ZuCoETReadingTaskDataset,
+            num_epochs=30,
+            lr_encoder=2e-4,
+            lr_projector=1e-4,
+            lr_base=2e-4,
+            metric_func=lambda preds, golds: {
+                "accuracy": self._calculate_accuracy(preds, golds)
+            },
+            batch_size=batch_size,
+            eval_only=eval_only,
+        )
+
+    def stage9b_et2_reading_task(
+        self, batch_size: int = None, eval_only: bool = False
+    ) -> Dict[str, Any]:
+        """Stage 9b: ZuCo 2.0 Eye-Tracking Reading Task Classification.
+
+        Task: Given word-level eye-tracking metrics recorded during reading (ZuCo 2.0),
+        classify whether the reader was engaged in Normal Reading or Task-Specific Reading.
+
+        Configuration:
+        - Epochs: 30
+        - OpenTSLMSP: encoder_lr=2e-4, projector_lr=1e-4
+        - OpenTSLMFlamingo: base_lr=2e-4
+        - Metric: Accuracy
+        """
+        return self._train_stage(
+            stage_name="stage9b_et2_reading_task",
+            dataset_class=ZuCo2ETReadingTaskDataset,
             num_epochs=30,
             lr_encoder=2e-4,
             lr_projector=1e-4,
@@ -1591,20 +1747,32 @@ class CurriculumTrainer:
                 )
                 results[stage] = stage_results
                 self._mark_stage_completed(stage, stage_results)
-            elif stage == "stage4_sleep_cot":
-                stage_results = self.stage4_sleep_cot(
-                    batch_size=batch_size, eval_only=eval_only
-                )
-                results[stage] = stage_results
-                self._mark_stage_completed(stage, stage_results)
-            elif stage == "stage5_ecg_cot":
-                stage_results = self.stage5_ecg_cot(
-                    batch_size=batch_size, eval_only=eval_only
-                )
-                results[stage] = stage_results
-                self._mark_stage_completed(stage, stage_results)
             elif stage == "stage6_financial_reports":
                 stage_results = self.stage6_financial_reports(
+                    batch_size=batch_size, eval_only=eval_only
+                )
+                results[stage] = stage_results
+                self._mark_stage_completed(stage, stage_results)
+            elif stage == "stage7_eeg_reading_task":
+                stage_results = self.stage7_eeg_reading_task(
+                    batch_size=batch_size, eval_only=eval_only
+                )
+                results[stage] = stage_results
+                self._mark_stage_completed(stage, stage_results)
+            elif stage == "stage8_eeg_sentiment":
+                stage_results = self.stage8_eeg_sentiment(
+                    batch_size=batch_size, eval_only=eval_only
+                )
+                results[stage] = stage_results
+                self._mark_stage_completed(stage, stage_results)
+            elif stage == "stage9_et_reading_task":
+                stage_results = self.stage9_et_reading_task(
+                    batch_size=batch_size, eval_only=eval_only
+                )
+                results[stage] = stage_results
+                self._mark_stage_completed(stage, stage_results)
+            elif stage == "stage9b_et2_reading_task":
+                stage_results = self.stage9b_et2_reading_task(
                     batch_size=batch_size, eval_only=eval_only
                 )
                 results[stage] = stage_results
@@ -1826,6 +1994,20 @@ def main():
         help="Skip training and only run evaluation (requires existing checkpoint)",
     )
 
+    # External checkpoint and experiment tag
+    parser.add_argument(
+        "--init_checkpoint",
+        type=str,
+        default=None,
+        help="Path to an external .pt checkpoint file; bypasses previous-stage loading",
+    )
+    parser.add_argument(
+        "--experiment_tag",
+        type=str,
+        default=None,
+        help="Tag appended to results dir: results/{llm_id}/{model_type}_{tag}/",
+    )
+
     # Model-specific arguments
     parser.add_argument(
         "--llm_id",
@@ -1877,6 +2059,8 @@ def main():
         dist_backend=args.dist_backend,
         local_rank=args.local_rank,
         llm_id=args.llm_id,
+        init_checkpoint=args.init_checkpoint,
+        experiment_tag=args.experiment_tag,
     )
 
     # Run curriculum
