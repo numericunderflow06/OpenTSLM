@@ -27,6 +27,7 @@ from time_series_datasets.zuco_eeg.ZuCoEEGReadingTaskDataset import ZuCoEEGReadi
 from time_series_datasets.zuco_eeg.ZuCoEEGSentimentDataset import ZuCoEEGSentimentDataset
 from time_series_datasets.zuco_eyetracking.ZuCoETReadingTaskDataset import ZuCoETReadingTaskDataset
 from time_series_datasets.zuco_eyetracking.ZuCo2ETReadingTaskDataset import ZuCo2ETReadingTaskDataset
+from time_series_datasets.bosch_heatpump.BoschHeatPumpQADataset import BoschHeatPumpQADataset
 from time_series_datasets.util import (
     extend_time_series_to_match_patch_size_and_aggregate,
 )
@@ -81,6 +82,7 @@ CURRICULUM_STAGES = [
     "stage8_eeg_sentiment",
     "stage9_et_reading_task",
     "stage9b_et2_reading_task",
+    "stage_bosch_heatpump",
 ]
 
 
@@ -1153,7 +1155,7 @@ class CurriculumTrainer:
                     print()
             else:
                 # Only allow fresh model for first stage
-                if stage_name not in (CURRICULUM_STAGES[0], "stage4_sleep_cot", "stage6_financial_reports", "stage9_et_reading_task", "stage9b_et2_reading_task"):
+                if stage_name not in (CURRICULUM_STAGES[0], "stage4_sleep_cot", "stage6_financial_reports", "stage9_et_reading_task", "stage9b_et2_reading_task", "stage_bosch_heatpump"):
                     raise RuntimeError(
                         f"Cannot start {stage_name} with fresh model. Previous stage {CURRICULUM_STAGES[CURRICULUM_STAGES.index(stage_name) - 1]} must be completed first."
                     )
@@ -1768,6 +1770,33 @@ class CurriculumTrainer:
             eval_only=eval_only,
         )
 
+    def stage_bosch_heatpump(
+        self, batch_size: int = None, eval_only: bool = False
+    ) -> Dict[str, Any]:
+        """Stage: Bosch Heat Pump Expert Commentary Generation.
+
+        Task: Given daily energy/temperature time series from a Bosch heat pump
+        installation plus building metadata, generate expert commentary
+        (in German) about space heating and domestic hot water performance.
+
+        Configuration:
+        - Epochs: 30
+        - OpenTSLMSP: encoder_lr=2e-4, projector_lr=1e-4
+        - OpenTSLMFlamingo: base_lr=2e-4
+        - Metric: Test loss only (free-form text generation)
+        """
+        return self._train_stage(
+            stage_name="stage_bosch_heatpump",
+            dataset_class=BoschHeatPumpQADataset,
+            num_epochs=30,
+            lr_encoder=2e-4,
+            lr_projector=1e-4,
+            lr_base=2e-4,
+            metric_func=None,  # Free-form text generation — use test loss
+            batch_size=batch_size,
+            eval_only=eval_only,
+        )
+
     def run_curriculum(
         self, stages: List[str] = None, batch_size: int = None, eval_only: bool = False
     ):
@@ -1867,6 +1896,12 @@ class CurriculumTrainer:
                 self._mark_stage_completed(stage, stage_results)
             elif stage == "stage9b_et2_reading_task":
                 stage_results = self.stage9b_et2_reading_task(
+                    batch_size=batch_size, eval_only=eval_only
+                )
+                results[stage] = stage_results
+                self._mark_stage_completed(stage, stage_results)
+            elif stage == "stage_bosch_heatpump":
+                stage_results = self.stage_bosch_heatpump(
                     batch_size=batch_size, eval_only=eval_only
                 )
                 results[stage] = stage_results
