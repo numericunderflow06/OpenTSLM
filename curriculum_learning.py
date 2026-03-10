@@ -63,7 +63,6 @@ from model_config import (
     LR_ENCODER,
     LR_PROJECTOR,
     NUM_EPOCHS,
-    PATCH_SIZE,
     WARMUP_FRAC,
     WEIGHT_DECAY,
 )
@@ -130,6 +129,8 @@ class CurriculumTrainer:
         llm_id: str = None,
         init_checkpoint: str = None,
         experiment_tag: str = None,
+        encoder_type: str = "transformer_cnn",
+        max_samples: int = None,
     ):
         """
         Initialize the curriculum trainer.
@@ -144,6 +145,8 @@ class CurriculumTrainer:
             llm_id: LLM model ID (e.g., 'google/medgemma-2b', 'meta-llama/Llama-3.2-1B')
             init_checkpoint: Path to an external .pt checkpoint file; bypasses previous-stage loading
             experiment_tag: Tag appended to results dir: results/{llm_id}/{model_type}_{tag}/
+            encoder_type: Encoder type ('transformer_cnn' or 'moment')
+            max_samples: Max samples per split (for quick experiments)
         """
         self.model_type = model_type
         self.device = device or self._get_device()
@@ -155,6 +158,8 @@ class CurriculumTrainer:
         self.llm_id_safe = self._sanitize_llm_id(llm_id)
         self.init_checkpoint = init_checkpoint
         self.experiment_tag = experiment_tag
+        self.encoder_type = encoder_type
+        self.max_samples = max_samples
 
         # Distributed training parameters
         self.gradient_checkpointing = gradient_checkpointing
@@ -188,7 +193,7 @@ class CurriculumTrainer:
     def _initialize_model(self):
         """Initialize the specified model type."""
         if self.model_type == "OpenTSLMSP":
-            model = OpenTSLMSP(llm_id=self.llm_id, device=self.device).to(self.device)
+            model = OpenTSLMSP(llm_id=self.llm_id, device=self.device, encoder_type=self.encoder_type).to(self.device)
 
         elif self.model_type == "OpenTSLMFlamingo":
             model = OpenTSLMFlamingo(
@@ -247,21 +252,26 @@ class CurriculumTrainer:
 
         if self.model_type == "OpenTSLMSP":
             # Parameter groups with different learning rates for SP
-            enc_params = list(model.encoder.parameters())
+            # Skip encoder params if encoder is frozen (e.g., pretrained MOMENT)
+            enc_params = [p for p in model.encoder.parameters() if p.requires_grad]
             proj_params = list(model.projector.projector.parameters())
 
             # Use provided learning rates or defaults
             encoder_lr = lr_encoder if lr_encoder is not None else LR_ENCODER
             projector_lr = lr_projector if lr_projector is not None else LR_PROJECTOR
 
-            param_groups = [
-                {"params": enc_params, "lr": encoder_lr, "weight_decay": WEIGHT_DECAY},
+            param_groups = []
+            if enc_params:
+                param_groups.append(
+                    {"params": enc_params, "lr": encoder_lr, "weight_decay": WEIGHT_DECAY},
+                )
+            param_groups.append(
                 {
                     "params": proj_params,
                     "lr": projector_lr,
                     "weight_decay": WEIGHT_DECAY,
                 },
-            ]
+            )
 
             # Add LoRA parameters if enabled
             if hasattr(model, "lora_enabled") and model.lora_enabled:
@@ -289,7 +299,10 @@ class CurriculumTrainer:
             else:
                 if self.rank == 0:
                     print(f"📊 Learning rates for {self.model_type}:")
-                    print(f"   Encoder LR: {encoder_lr:.2e}")
+                    if enc_params:
+                        print(f"   Encoder LR: {encoder_lr:.2e}")
+                    else:
+                        print(f"   Encoder: frozen (pretrained, no trainable params)")
                     print(f"   Projector LR: {projector_lr:.2e}")
 
             return AdamW(param_groups)
@@ -376,13 +389,17 @@ class CurriculumTrainer:
 
         if self.model_type == "OpenTSLMSP":
             checkpoint = {
-                "encoder_state": model.encoder.state_dict(),
+                "encoder_type": getattr(model, "encoder_type", "transformer_cnn"),
                 "projector_state": model.projector.state_dict(),
                 "optimizer_state": optimizer.state_dict(),
                 "scheduler_state": scheduler.state_dict(),
                 "val_loss": val_loss,
                 "epoch": epoch,
             }
+
+            # Only save encoder state for trainable encoders (skip frozen pretrained)
+            if getattr(model, "encoder_type", "transformer_cnn") != "moment":
+                checkpoint["encoder_state"] = model.encoder.state_dict()
 
             # Add LoRA state to checkpoint
             model.save_lora_state_to_checkpoint(checkpoint)
@@ -510,7 +527,10 @@ class CurriculumTrainer:
             model = self._get_model()
 
             if self.model_type == "OpenTSLMSP":
-                model.encoder.load_state_dict(checkpoint["encoder_state"])
+                # Only load encoder state if present (won't be for frozen pretrained encoders)
+                if "encoder_state" in checkpoint:
+                    model.encoder.load_state_dict(checkpoint["encoder_state"])
+
                 model.projector.load_state_dict(checkpoint["projector_state"])
 
                 # Load LoRA state using the OpenTSLMSP method (allow missing for backward compatibility)
@@ -619,7 +639,8 @@ class CurriculumTrainer:
             )
             model = self._get_model()
             if self.model_type == "OpenTSLMSP":
-                model.encoder.load_state_dict(checkpoint["encoder_state"])
+                if "encoder_state" in checkpoint:
+                    model.encoder.load_state_dict(checkpoint["encoder_state"])
                 model.projector.load_state_dict(checkpoint["projector_state"])
                 try:
                     model.load_lora_state_from_checkpoint(
@@ -661,7 +682,7 @@ class CurriculumTrainer:
             )
             if not os.path.exists(metrics_file):
                 # PATCH: If running stage2_captioning and previous stage metrics are missing, skip loading
-                if current_stage in ("stage2_captioning", "stage6_financial_reports", "stage7_eeg_reading_task", "stage8_eeg_sentiment", "stage9_et_reading_task", "stage9b_et2_reading_task"):
+                if current_stage in ("stage2_captioning", "stage4_sleep_cot", "stage6_financial_reports", "stage7_eeg_reading_task", "stage8_eeg_sentiment", "stage9_et_reading_task", "stage9b_et2_reading_task"):
                     if self.rank == 0:
                         print(
                             f"⚠️  Skipping previous stage {previous_stage} because metrics file not found: {metrics_file}"
@@ -687,7 +708,7 @@ class CurriculumTrainer:
             )
             if not os.path.exists(checkpoint_path):
                 # PATCH: If running stage2_captioning and previous stage checkpoint is missing, skip loading
-                if current_stage in ("stage2_captioning", "stage6_financial_reports", "stage7_eeg_reading_task", "stage8_eeg_sentiment", "stage9_et_reading_task", "stage9b_et2_reading_task"):
+                if current_stage in ("stage2_captioning", "stage4_sleep_cot", "stage6_financial_reports", "stage7_eeg_reading_task", "stage8_eeg_sentiment", "stage9_et_reading_task", "stage9b_et2_reading_task"):
                     if self.rank == 0:
                         print(
                             f"⚠️  Skipping previous stage {previous_stage} because checkpoint not found: {checkpoint_path}"
@@ -711,7 +732,8 @@ class CurriculumTrainer:
             # Get the underlying model (handles DDP wrapping)
             model = self._get_model()
             if self.model_type == "OpenTSLMSP":
-                model.encoder.load_state_dict(checkpoint["encoder_state"])
+                if "encoder_state" in checkpoint:
+                    model.encoder.load_state_dict(checkpoint["encoder_state"])
                 model.projector.load_state_dict(checkpoint["projector_state"])
 
                 # Load LoRA state from previous stage (allow missing for stage transitions)
@@ -827,6 +849,64 @@ class CurriculumTrainer:
             correct += self._calculate_accuracy_baseline(gold, pred)
 
         return correct / total if total > 0 else 0.0
+
+    def _calculate_f1(
+        self, predictions: List[str], gold_answers: List[str]
+    ) -> Dict[str, Any]:
+        """Calculate per-class precision, recall, F1 and macro-F1."""
+        from collections import Counter
+
+        # Build per-sample match list using existing accuracy logic
+        pred_labels = []
+        gold_labels = []
+        for pred, gold in zip(predictions, gold_answers):
+            gt_clean = gold.replace("<|end_of_text|>", "").lower().strip()
+            gold_labels.append(gt_clean)
+
+            pred_clean = pred.lower().strip()
+            answer_match = re.search(r'answer:\s*(.+)', pred_clean, re.IGNORECASE)
+            if answer_match:
+                pred_clean = answer_match.group(1).strip()
+
+            # Use same matching logic as accuracy to determine predicted label
+            matched = False
+            if pred_clean == gt_clean:
+                pred_labels.append(gt_clean)
+                matched = True
+            elif pred_clean.startswith(gt_clean):
+                pred_labels.append(gt_clean)
+                matched = True
+            elif len(gt_clean) <= 3 and pred_clean[:3] == gt_clean[:3]:
+                pred_labels.append(gt_clean)
+                matched = True
+
+            if not matched:
+                # Prediction doesn't match gold; use cleaned prediction as its own label
+                pred_labels.append(pred_clean[:20])  # truncate for sanity
+
+        # Collect all unique classes
+        all_classes = sorted(set(gold_labels))
+
+        per_class = {}
+        f1_scores = []
+        for cls in all_classes:
+            tp = sum(1 for p, g in zip(pred_labels, gold_labels) if p == cls and g == cls)
+            fp = sum(1 for p, g in zip(pred_labels, gold_labels) if p == cls and g != cls)
+            fn = sum(1 for p, g in zip(pred_labels, gold_labels) if p != cls and g == cls)
+
+            precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+            recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+            f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+
+            per_class[cls] = {"precision": precision, "recall": recall, "f1": f1}
+            f1_scores.append(f1)
+
+        macro_f1 = sum(f1_scores) / len(f1_scores) if f1_scores else 0.0
+
+        return {
+            "macro_f1": macro_f1,
+            "per_class_metrics": per_class,
+        }
 
     def _evaluate_stage(
         self,
@@ -1073,7 +1153,7 @@ class CurriculumTrainer:
                     print()
             else:
                 # Only allow fresh model for first stage
-                if stage_name not in (CURRICULUM_STAGES[0], "stage6_financial_reports", "stage9_et_reading_task", "stage9b_et2_reading_task"):
+                if stage_name not in (CURRICULUM_STAGES[0], "stage4_sleep_cot", "stage6_financial_reports", "stage9_et_reading_task", "stage9b_et2_reading_task"):
                     raise RuntimeError(
                         f"Cannot start {stage_name} with fresh model. Previous stage {CURRICULUM_STAGES[CURRICULUM_STAGES.index(stage_name) - 1]} must be completed first."
                     )
@@ -1143,6 +1223,24 @@ class CurriculumTrainer:
         # Initialize optimizer and scheduler
         optimizer = self._get_optimizer(batch_size, lr_encoder, lr_projector, lr_base)
 
+        # Use model's patch_size (varies by encoder: 4 for TransformerCNN, 8 for MOMENT)
+        patch_size = self._get_model().patch_size
+
+        # Create datasets
+        eos = self._get_model().get_eos_token()
+        train_dataset = dataset_class("train", EOS_TOKEN=eos)
+        val_dataset = dataset_class("validation", EOS_TOKEN=eos)
+        test_dataset = dataset_class("test", EOS_TOKEN=eos)
+
+        # Subsample if max_samples is set
+        if self.max_samples is not None:
+            for ds, name in [(train_dataset, "train"), (val_dataset, "val"), (test_dataset, "test")]:
+                orig = len(ds)
+                if orig > self.max_samples:
+                    ds.dataset = ds.dataset[:self.max_samples]
+                    if self.rank == 0:
+                        print(f"   Subsampled {name}: {orig} → {len(ds)}")
+
         # Create data loaders
         if sampler is not None:
             if self.world_size > 1:
@@ -1150,49 +1248,42 @@ class CurriculumTrainer:
                     "BalancedBatchSampler was provided, but distributed training (DDP) is enabled. BalancedBatchSampler will NOT be used. Data will be sharded using DistributedSampler instead. Typically for stage3_cot it is better to use BalancedBatchSampler, if dataset is imbalanced."
                 )
                 train_loader = self._merge_data_loaders(
-                    [
-                        dataset_class(
-                            "train", EOS_TOKEN=self._get_model().get_eos_token()
-                        )
-                    ],
+                    [train_dataset],
                     shuffle=True,
                     batch_size=batch_size,
-                    patch_size=PATCH_SIZE,
+                    patch_size=patch_size,
                     distribute_data=True,
                 )
             else:
-                train_dataset = dataset_class(
-                    "train", EOS_TOKEN=self._get_model().get_eos_token()
-                )
                 train_loader = DataLoader(
                     train_dataset,
                     batch_sampler=sampler,
                     collate_fn=lambda batch: extend_time_series_to_match_patch_size_and_aggregate(
-                        batch, patch_size=PATCH_SIZE
+                        batch, patch_size=patch_size
                     ),
                 )
         else:
             train_loader = self._merge_data_loaders(
-                [dataset_class("train", EOS_TOKEN=self._get_model().get_eos_token())],
+                [train_dataset],
                 shuffle=True,
                 batch_size=batch_size,
-                patch_size=PATCH_SIZE,
+                patch_size=patch_size,
                 distribute_data=self.world_size > 1,
             )
 
         val_loader = self._merge_data_loaders(
-            [dataset_class("validation", EOS_TOKEN=self._get_model().get_eos_token())],
+            [val_dataset],
             shuffle=False,
             batch_size=1,
-            patch_size=PATCH_SIZE,
+            patch_size=patch_size,
             distribute_data=False,  # Don't distribute validation
         )
 
         test_loader = self._merge_data_loaders(
-            [dataset_class("test", EOS_TOKEN=self._get_model().get_eos_token())],
+            [test_dataset],
             shuffle=False,
             batch_size=1,
-            patch_size=PATCH_SIZE,
+            patch_size=patch_size,
             distribute_data=self.world_size > 1,
         )
 
@@ -1395,6 +1486,11 @@ class CurriculumTrainer:
         - OpenTSLMFlamingo: base_lr=2e-4
         - Metric: Accuracy
         """
+        def _stage1_metrics(preds, golds):
+            metrics = {"accuracy": self._calculate_accuracy(preds, golds)}
+            metrics.update(self._calculate_f1(preds, golds))
+            return metrics
+
         return self._train_stage(
             stage_name="stage1_mcq",
             dataset_class=TSQADataset,
@@ -1402,9 +1498,7 @@ class CurriculumTrainer:
             lr_encoder=2e-4,
             lr_projector=1e-4,
             lr_base=2e-4,
-            metric_func=lambda preds, golds: {
-                "accuracy": self._calculate_accuracy(preds, golds)
-            },
+            metric_func=_stage1_metrics,
             batch_size=batch_size,
             eval_only=eval_only,
         )
@@ -1922,41 +2016,6 @@ class CurriculumTrainer:
                 else:
                     print(f"ℹ️  LoRA not configured for {stage_name}")
 
-    def _enable_lora_if_needed(self, stage_name: str):
-        """Enable LoRA for OpenTSLMSP models in stages after stage2."""
-        if self.model_type != "OpenTSLMSP":
-            return  # LoRA only for OpenTSLMSP
-
-        # Get the underlying model (handles DDP wrapping)
-        model = self._get_model()
-
-        # Enable LoRA for stages after stage2_captioning
-        stages_with_lora = ["stage3_cot", "stage4_sleep_cot", "stage5_ecg_cot"]
-
-        if stage_name in stages_with_lora:
-            if not getattr(model, "lora_enabled", False):
-                if self.rank == 0:
-                    print(f"🔧 Enabling LoRA for {stage_name}")
-                try:
-                    model.enable_lora(lora_r=16, lora_alpha=32, lora_dropout=0.0)
-                    if self.rank == 0:
-                        print(f"✅ LoRA enabled for {stage_name}")
-                except Exception as e:
-                    if self.rank == 0:
-                        print(f"❌ Failed to enable LoRA for {stage_name}: {e}")
-                        print("   Continuing without LoRA...")
-            else:
-                if self.rank == 0:
-                    print(f"✅ LoRA already enabled for {stage_name}")
-        else:
-            if self.rank == 0:
-                if stage_name in ["stage1_mcq", "stage2_captioning"]:
-                    print(
-                        f"ℹ️  LoRA disabled for {stage_name} (only enabled for stages 3+)"
-                    )
-                else:
-                    print(f"ℹ️  LoRA not configured for {stage_name}")
-
 
 def main():
     parser = argparse.ArgumentParser(
@@ -2008,6 +2067,15 @@ def main():
         help="Tag appended to results dir: results/{llm_id}/{model_type}_{tag}/",
     )
 
+    # Encoder selection
+    parser.add_argument(
+        "--encoder_type",
+        type=str,
+        choices=["transformer_cnn", "moment"],
+        default="transformer_cnn",
+        help="Time series encoder type ('transformer_cnn' or 'moment' for pretrained MOMENT-1-large)",
+    )
+
     # Model-specific arguments
     parser.add_argument(
         "--llm_id",
@@ -2039,6 +2107,14 @@ def main():
         help="Local GPU rank",
     )
 
+    # Subsampling
+    parser.add_argument(
+        "--max_samples",
+        type=int,
+        default=None,
+        help="Max samples per split for quick experiments (default: use full dataset)",
+    )
+
     # Logging arguments
     parser.add_argument(
         "--verbose", default=False, action="store_true", help="Enable verbose logging"
@@ -2061,6 +2137,8 @@ def main():
         llm_id=args.llm_id,
         init_checkpoint=args.init_checkpoint,
         experiment_tag=args.experiment_tag,
+        encoder_type=args.encoder_type,
+        max_samples=args.max_samples,
     )
 
     # Run curriculum

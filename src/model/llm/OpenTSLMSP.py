@@ -24,6 +24,13 @@ from model_config import ENCODER_OUTPUT_DIM
 from model.llm.TimeSeriesLLM import TimeSeriesLLM
 from model.encoder.TransformerCNNEncoder import TransformerCNNEncoder
 from model.projector.MLPProjector import MLPProjector
+
+try:
+    from model.encoder.MOMENTEncoder import MOMENTEncoder
+
+    MOMENT_AVAILABLE = True
+except ImportError:
+    MOMENT_AVAILABLE = False
 from prompt.full_prompt import FullPrompt
 from time_series_datasets.util import (
     extend_time_series_to_match_patch_size_and_aggregate,
@@ -35,8 +42,10 @@ class OpenTSLMSP(TimeSeriesLLM):
         self,
         llm_id: str = "meta-llama/Llama-3.2-1B",
         device: str = "cuda",
+        encoder_type: str = "transformer_cnn",
     ):
         super().__init__(device)
+        self.encoder_type = encoder_type
 
         # 1) tokenizer (ensure pad_token exists)
         self.tokenizer = AutoTokenizer.from_pretrained(llm_id, use_fast=True)
@@ -53,12 +62,23 @@ class OpenTSLMSP(TimeSeriesLLM):
         self.llm.resize_token_embeddings(len(self.tokenizer))
 
         # 3) encoder + projector (now internal)
-        self.encoder = TransformerCNNEncoder().to(device)
-        self.projector = MLPProjector(
-            ENCODER_OUTPUT_DIM, self.llm.config.hidden_size, device=device
-        ).to(device)
+        if encoder_type == "moment":
+            if not MOMENT_AVAILABLE:
+                raise RuntimeError(
+                    "momentfm package is required for MOMENT encoder. "
+                    "Install with: pip install momentfm"
+                )
+            self.encoder = MOMENTEncoder(freeze=True).to(device)
+            encoder_out_dim = MOMENTEncoder.MOMENT_D_MODEL  # 1024
+            self.patch_size = MOMENTEncoder.MOMENT_PATCH_LEN  # 8
+        else:
+            self.encoder = TransformerCNNEncoder().to(device)
+            encoder_out_dim = ENCODER_OUTPUT_DIM  # 128
+            self.patch_size = 4
 
-        self.patch_size = 4
+        self.projector = MLPProjector(
+            encoder_out_dim, self.llm.config.hidden_size, device=device
+        ).to(device)
 
         # LoRA-related attributes
         self.lora_enabled = False
@@ -370,9 +390,13 @@ class OpenTSLMSP(TimeSeriesLLM):
 
     def store_to_file(self, path: str):
         checkpoint = {
-            "encoder_state": self.encoder.state_dict(),
+            "encoder_type": self.encoder_type,
             "projector_state": self.projector.state_dict(),
         }
+
+        # Only save encoder state for trainable encoders (skip frozen pretrained)
+        if self.encoder_type != "moment":
+            checkpoint["encoder_state"] = self.encoder.state_dict()
 
         # Add LoRA state to checkpoint
         self.save_lora_state_to_checkpoint(checkpoint)
@@ -381,7 +405,11 @@ class OpenTSLMSP(TimeSeriesLLM):
 
     def load_from_file(self, path: str):
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
-        self.encoder.load_state_dict(ckpt["encoder_state"])
+
+        # Only load encoder state if it's present (won't be for frozen pretrained encoders)
+        if "encoder_state" in ckpt:
+            self.encoder.load_state_dict(ckpt["encoder_state"])
+
         self.projector.load_state_dict(ckpt["projector_state"])
 
         # Load LoRA state if present (allow missing for backward compatibility)
@@ -500,6 +528,6 @@ class OpenTSLMSP(TimeSeriesLLM):
 
         batch = [prompt.to_dict()]
         self.eval()
-        batch = extend_time_series_to_match_patch_size_and_aggregate(batch)
+        batch = extend_time_series_to_match_patch_size_and_aggregate(batch, patch_size=self.patch_size)
         output = self.generate(batch, max_new_tokens=max_new_tokens)
         return output[0]
