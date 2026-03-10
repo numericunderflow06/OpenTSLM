@@ -684,7 +684,7 @@ class CurriculumTrainer:
             )
             if not os.path.exists(metrics_file):
                 # PATCH: If running stage2_captioning and previous stage metrics are missing, skip loading
-                if current_stage in ("stage2_captioning", "stage4_sleep_cot", "stage6_financial_reports", "stage7_eeg_reading_task", "stage8_eeg_sentiment", "stage9_et_reading_task", "stage9b_et2_reading_task"):
+                if current_stage in ("stage2_captioning", "stage4_sleep_cot", "stage6_financial_reports", "stage7_eeg_reading_task", "stage8_eeg_sentiment", "stage9_et_reading_task", "stage9b_et2_reading_task", "stage_bosch_heatpump"):
                     if self.rank == 0:
                         print(
                             f"⚠️  Skipping previous stage {previous_stage} because metrics file not found: {metrics_file}"
@@ -1226,7 +1226,8 @@ class CurriculumTrainer:
         optimizer = self._get_optimizer(batch_size, lr_encoder, lr_projector, lr_base)
 
         # Use model's patch_size (varies by encoder: 4 for TransformerCNN, 8 for MOMENT)
-        patch_size = self._get_model().patch_size
+        from model_config import PATCH_SIZE
+        patch_size = getattr(self._get_model(), "patch_size", PATCH_SIZE)
 
         # Create datasets
         eos = self._get_model().get_eos_token()
